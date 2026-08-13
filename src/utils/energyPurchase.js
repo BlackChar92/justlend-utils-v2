@@ -22,8 +22,7 @@ export const ENERGY_PURCHASE_PATHS = Object.freeze({
   poolHealth: '/v1/pool/health',
   quote: '/v1/price',
   buy: '/v1/consumer/energy/buy',
-  order: id => `/v1/consumer/energy/orders/${encodeURIComponent(String(id))}`,
-  history: '/v1/consumer/energy/orders/history'
+  order: id => `/v1/consumer/energy/orders/${encodeURIComponent(String(id))}`
 });
 
 export const ENERGY_PURCHASE_TERMINAL_STATES = Object.freeze([
@@ -39,6 +38,19 @@ const PAYMENT_LOCK_PREFIX = 'justlend_energy_purchase_lock:';
 const DEFAULT_ORDER_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_PAYMENT_RETRY_MS = 2 * 60 * 1000;
 const DEFAULT_PURCHASE_INTENT_TTL_MS = 30 * 60 * 1000;
+const DETERMINISTIC_PRE_BROADCAST_CODES = new Set([
+  'ADDR_OVERFLOW',
+  'BAD_REQUEST',
+  'CONFIG_INVALID',
+  'EMPTY_RECEIVERS',
+  'INVALID_DURATION',
+  'INVALID_RECEIVERS',
+  'PAYMENT_CALC_FAILED',
+  'POOL_INSUFFICIENT',
+  'PRICE_MOVED',
+  'RECEIVER_IS_CONTRACT',
+  'TX_EXPIRED'
+]);
 const activePayerPurchases = new Set();
 
 export class EnergyPurchaseError extends Error {
@@ -108,7 +120,7 @@ function validateQuoteInput(input, config) {
   }
   const min = Number(config.min_energy);
   const max = Number(config.max_energy);
-  const maxReceivers = Number(config.max_receivers);
+  const maxReceivers = Number(config.max_batch_receivers);
   if (![min, max, maxReceivers].every(Number.isSafeInteger) || min <= 0 || max < min || maxReceivers <= 0) {
     throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy purchase limits returned by the API are invalid.');
   }
@@ -118,10 +130,70 @@ function validateQuoteInput(input, config) {
   if (receivers.length > maxReceivers) {
     throw new EnergyPurchaseError('ADDR_OVERFLOW', `A maximum of ${maxReceivers} receivers is allowed.`);
   }
-  const resourcePools = new Set(Array.isArray(config.resource_pool_addresses) ? config.resource_pool_addresses : []);
-  if (receivers.some(address => resourcePools.has(address))) {
-    throw new EnergyPurchaseError('INVALID_RECEIVERS', 'Resource-pool addresses cannot receive purchased energy.');
+  const durations = Array.isArray(config.supported_durations)
+    ? config.supported_durations.filter(value => typeof value === 'string' && value.trim())
+    : [];
+  if (typeof input.duration !== 'string' || !durations.includes(input.duration)) {
+    throw new EnergyPurchaseError(
+      'INVALID_DURATION',
+      'duration must be explicitly selected from the live /v1/config supported_durations list.'
+    );
   }
+  validateAddress(config.payment_address, 'config payment_address');
+}
+
+function normalizeHex(value) {
+  return typeof value === 'string' ? value.replace(/^0x/i, '').toLowerCase() : '';
+}
+
+function rpcFingerprint(tronWeb) {
+  const endpoints = [tronWeb?.fullNode?.host, tronWeb?.solidityNode?.host, tronWeb?.eventServer?.host]
+    .filter(value => typeof value === 'string' && value.trim())
+    .map(value => {
+      try {
+        const parsed = new URL(value);
+        return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/$/, '')}`;
+      } catch {
+        return String(value).trim();
+      }
+    });
+  return endpoints.length ? [...new Set(endpoints)].join('|') : '';
+}
+
+async function consumerBuyMemo(receivers, energyPerReceiver, duration) {
+  if (typeof globalThis.crypto?.subtle?.digest !== 'function' || typeof globalThis.TextEncoder !== 'function') {
+    throw new EnergyPurchaseError('CONFIG_MISSING', 'Web Crypto SHA-256 and TextEncoder are required for payment intent binding.');
+  }
+  const payload = ['a6-buy-v1', String(energyPerReceiver), duration, ...receivers].join('\u0000');
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+  const hex = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  return `a6-buy-v1:${hex}`;
+}
+
+function attachMemo(tronWeb, transaction, memo) {
+  if (!transaction || typeof transaction !== 'object' || !transaction.raw_data) {
+    throw new EnergyPurchaseError('INVALID_UNSIGNED_TX', 'tronWeb returned a transaction without raw_data.');
+  }
+  const txJsonToPb = tronWeb?.utils?.transaction?.txJsonToPb;
+  const txPbToRawDataHex = tronWeb?.utils?.transaction?.txPbToRawDataHex;
+  const txPbToTxID = tronWeb?.utils?.transaction?.txPbToTxID;
+  if (![txJsonToPb, txPbToRawDataHex, txPbToTxID].every(fn => typeof fn === 'function')) {
+    throw new EnergyPurchaseError(
+      'CONFIG_MISSING',
+      'tronWeb transaction protobuf utilities are required to bind the payment memo safely.'
+    );
+  }
+  const payable = {
+    ...transaction,
+    raw_data: { ...transaction.raw_data, data: Array.from(new TextEncoder().encode(memo), byte => byte.toString(16).padStart(2, '0')).join('') }
+  };
+  const protobuf = txJsonToPb(payable);
+  payable.raw_data_hex = normalizeHex(txPbToRawDataHex(protobuf));
+  payable.txID = normalizeHex(txPbToTxID(protobuf));
+  if (!payable.txID || !payable.raw_data_hex) {
+    throw new EnergyPurchaseError('INVALID_UNSIGNED_TX', 'Unable to derive the memo-bound transaction identity.');
+  }
+  return payable;
 }
 
 function defaultStorage() {
@@ -193,6 +265,11 @@ function assertRiskRecord(risk, payerAddress) {
     !validStateIdentity ||
     !validTimes ||
     typeof risk.paymentConfirmed !== 'boolean' ||
+    (risk.networkFingerprint !== undefined &&
+      (typeof risk.networkFingerprint !== 'string' || risk.networkFingerprint.length === 0)) ||
+    (risk.signedRequest !== undefined &&
+      (!risk.signedRequest || typeof risk.signedRequest !== 'object' ||
+        risk.signedRequest?.signed_transaction?.txID !== risk.signedTxId)) ||
     (risk.state !== undefined && !['preparing', 'signed'].includes(risk.state))
   ) {
     throw riskStoreError('Energy payment risk storage contains an invalid record.');
@@ -319,16 +396,46 @@ function normalizeSignedTransaction(signedTransaction) {
     !signed ||
     typeof signed !== 'object' ||
     typeof signed.txID !== 'string' ||
+    typeof signed.raw_data_hex !== 'string' ||
     !signed.raw_data ||
     !Array.isArray(signed.signature) ||
     signed.signature.length !== 1
   ) {
     throw new EnergyPurchaseError(
       'INVALID_SIGNED_TX',
-      'Signer must return one signed TRX TransferContract transaction with txID, raw_data, and one signature.'
+      'Signer must return one signed TRX TransferContract transaction with txID, raw_data_hex, raw_data, and one signature.'
     );
   }
   return signed;
+}
+
+function assertSignedTransactionMatches(unsigned, signed) {
+  if (
+    normalizeHex(signed.txID) !== normalizeHex(unsigned.txID) ||
+    normalizeHex(signed.raw_data_hex) !== normalizeHex(unsigned.raw_data_hex)
+  ) {
+    throw new EnergyPurchaseError(
+      'SIGNED_TX_MISMATCH',
+      'Signer returned a transaction that does not match the confirmed payer, recipient, amount, and request memo.'
+    );
+  }
+}
+
+function signedTransactionForWire(signed) {
+  return {
+    txID: normalizeHex(signed.txID),
+    raw_data_hex: normalizeHex(signed.raw_data_hex),
+    signature: [...signed.signature],
+    visible: signed.visible === true
+  };
+}
+
+function shouldClearSignedRisk(error) {
+  return error instanceof EnergyPurchaseError &&
+    error.isBusinessError &&
+    Number(error.status) >= 400 &&
+    Number(error.status) < 500 &&
+    DETERMINISTIC_PRE_BROADCAST_CODES.has(error.code);
 }
 
 function createAbortSignal(timeoutMs, externalSignal) {
@@ -370,6 +477,25 @@ export function createEnergyPurchaseClient(options = {}) {
   const orderTtlMs = options.orderTtlMs ?? DEFAULT_ORDER_TTL_MS;
   const sleep = options.sleep || sleepDefault;
   const now = options.now || Date.now;
+  const explicitNetworkFingerprint = typeof options.networkFingerprint === 'string'
+    ? options.networkFingerprint.trim()
+    : '';
+
+  function currentNetworkFingerprint() {
+    const provider = explicitNetworkFingerprint || rpcFingerprint(tronWeb);
+    return provider ? `api=${baseUrl};provider=${provider}` : '';
+  }
+
+  function requireNetworkFingerprint() {
+    const fingerprint = currentNetworkFingerprint();
+    if (!fingerprint) {
+      throw new EnergyPurchaseError(
+        'NETWORK_FINGERPRINT_REQUIRED',
+        'Energy purchase requires networkFingerprint or a tronWeb client with fixed provider hosts.'
+      );
+    }
+    return fingerprint;
+  }
 
   async function request(method, path, requestOptions = {}) {
     const { signal, cleanup } = createAbortSignal(requestOptions.timeoutMs ?? requestTimeoutMs, requestOptions.signal);
@@ -403,18 +529,21 @@ export function createEnergyPurchaseClient(options = {}) {
         cause
       });
     }
+    if (!response.ok) {
+      const code = typeof envelope?.code === 'string' && envelope.code.length > 0
+        ? envelope.code.toUpperCase()
+        : 'HTTP_ERROR';
+      throw new EnergyPurchaseError(code, envelope?.msg || `Energy purchase API returned HTTP ${response.status}.`, {
+        status: response.status,
+        isBusinessError: response.status >= 400 && response.status < 500 && code !== 'HTTP_ERROR',
+        retryable: response.status >= 500
+      });
+    }
     if (envelope?.code !== '0') {
       const businessCode = typeof envelope?.code === 'string' && envelope.code.length > 0;
       throw new EnergyPurchaseError(businessCode ? envelope.code.toUpperCase() : 'INVALID_RESPONSE', envelope?.msg, {
         status: response.status,
-        isBusinessError: businessCode,
-        retryable: !businessCode && response.status >= 500
-      });
-    }
-    if (!response.ok) {
-      throw new EnergyPurchaseError('HTTP_ERROR', `Energy purchase API returned HTTP ${response.status}.`, {
-        status: response.status,
-        retryable: response.status >= 500
+        isBusinessError: businessCode
       });
     }
     return envelope.data;
@@ -429,28 +558,16 @@ export function createEnergyPurchaseClient(options = {}) {
     validateQuoteInput(input, config);
     const result = await request('POST', ENERGY_PURCHASE_PATHS.quote, {
       ...requestOptions,
-      body: { receivers: input.receivers, energy_per_receiver: input.energyPerReceiver }
+      body: { receivers: input.receivers, quantity: input.energyPerReceiver, duration: input.duration }
     });
     if (
       !result ||
-      typeof result.can_fulfill !== 'boolean' ||
-      !Number.isSafeInteger(Number(result.amount_sun)) ||
-      Number(result.amount_sun) <= 0 ||
-      typeof result.pay_address !== 'string'
+      !Number.isSafeInteger(Number(result.total_sun)) ||
+      Number(result.total_sun) <= 0
     ) {
       throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy purchase quote is missing required fields.');
     }
-    if (!result.can_fulfill) {
-      throw new EnergyPurchaseError('POOL_INSUFFICIENT', 'No single resource pool can fulfill this quote.', {
-        isBusinessError: true,
-        details: {
-          maxSingleOrderEnergy: result.max_single_order_energy ?? null,
-          requiredEnergy: input.energyPerReceiver * input.receivers.length
-        }
-      });
-    }
-    validateAddress(result.pay_address, 'quote pay_address');
-    return result;
+    return { ...result, payment_address: config.payment_address };
   }
 
   async function getOrder(orderId, requestOptions = {}) {
@@ -461,18 +578,15 @@ export function createEnergyPurchaseClient(options = {}) {
   }
 
   async function getHistory(address, historyOptions = {}) {
-    validateAddress(address, 'history address');
-    const query = new URLSearchParams({ address });
-    if (historyOptions.size !== undefined) {
-      validatePositiveInteger(historyOptions.page ?? 1, 'page');
-      validatePositiveInteger(historyOptions.size, 'size');
-      query.set('page', String(historyOptions.page ?? 1));
-      query.set('size', String(historyOptions.size));
-    }
-    return request('GET', `${ENERGY_PURCHASE_PATHS.history}?${query}`, historyOptions);
+    void address;
+    void historyOptions;
+    throw new EnergyPurchaseError(
+      'UNSUPPORTED_OPERATION',
+      'The authoritative energy API has no order-history endpoint; persist the returned order ID and access token.'
+    );
   }
 
-  async function buildAndSignPayment({ payerAddress, payAddress, amountSun, signTransaction }) {
+  async function buildAndSignPayment({ payerAddress, payAddress, amountSun, receivers, energyPerReceiver, duration, signTransaction }) {
     if (!tronWeb?.transactionBuilder?.sendTrx) {
       throw new EnergyPurchaseError('CONFIG_MISSING', 'tronWeb with transactionBuilder.sendTrx is required for signing.');
     }
@@ -482,6 +596,10 @@ export function createEnergyPurchaseClient(options = {}) {
     validateAddress(payerAddress, 'payerAddress');
     validateAddress(payAddress, 'payAddress');
     validatePositiveInteger(Number(amountSun), 'amountSun');
+    validatePositiveInteger(Number(energyPerReceiver), 'energyPerReceiver');
+    if (!Array.isArray(receivers) || receivers.length === 0 || typeof duration !== 'string' || !duration) {
+      throw new EnergyPurchaseError('INVALID_PAYMENT_INTENT', 'receivers and duration are required to bind the payment memo.');
+    }
     let unsigned = await tronWeb.transactionBuilder.sendTrx(payAddress, Number(amountSun), payerAddress);
     if (unsigned?.raw_data?.expiration && tronWeb.transactionBuilder.extendExpiration) {
       const extensionSeconds = Math.ceil((now() + orderTtlMs - Number(unsigned.raw_data.expiration)) / 1000);
@@ -494,11 +612,15 @@ export function createEnergyPurchaseClient(options = {}) {
         }
       }
     }
-    return normalizeSignedTransaction(
+    const memo = await consumerBuyMemo(receivers, Number(energyPerReceiver), duration);
+    unsigned = attachMemo(tronWeb, unsigned, memo);
+    const signed = normalizeSignedTransaction(
       await signTransaction(unsigned, {
         description: `Pay ${Number(amountSun) / 1e6} TRX for JustLend energy. Sign only; the service broadcasts.`
       })
     );
+    assertSignedTransactionMatches(unsigned, signed);
+    return signed;
   }
 
   async function lookupTransaction(txId) {
@@ -516,29 +638,32 @@ export function createEnergyPurchaseClient(options = {}) {
   async function reconcilePaymentRisksUnlocked(payerAddress) {
     validateAddress(payerAddress, 'payerAddress');
     const risks = readRisks(storage, payerAddress);
-    let history = null;
+    const fingerprint = currentNetworkFingerprint();
     for (const risk of risks) {
-      if (!risk.signedTxId) {
-        if (now() >= risk.expiresAt) clearRisk(storage, payerAddress, risk.intentId);
+      // Legacy/preparing records deliberately stay blocked: they do not contain
+      // enough immutable evidence to prove that no signature escaped.
+      if (!risk.signedTxId || !risk.signedRequest || !risk.networkFingerprint) {
         continue;
       }
-      const lookup = await lookupTransaction(risk.signedTxId);
-      if (lookup === 'found') {
+      if (!fingerprint || risk.networkFingerprint !== fingerprint) continue;
+      try {
+        const recoveredOrder = await request('POST', ENERGY_PURCHASE_PATHS.buy, { body: risk.signedRequest });
+        // Keep an accepted/recovered marker until the caller explicitly records
+        // the returned order and clears it. Automatically clearing here would
+        // let purchase() sign a second payment in the same invocation.
         risk.paymentConfirmed = true;
+        risk.recoveredOrder = recoveredOrder;
         writeRisk(storage, risk);
-        if (history === null) {
-          try {
-            history = await getHistory(payerAddress);
-          } catch {
-            history = {};
-          }
-        }
-        const rows = Array.isArray(history?.rows) ? history.rows : [];
-        if (rows.some(row => row.payment_tx_id === risk.signedTxId)) {
+      } catch (error) {
+        if (error.code === 'TX_ALREADY_CLAIMED') {
+          risk.paymentConfirmed = true;
+          writeRisk(storage, risk);
+        } else if (shouldClearSignedRisk(error)) {
           clearRisk(storage, payerAddress, risk.signedTxId);
+        } else if (await lookupTransaction(risk.signedTxId) === 'found') {
+          risk.paymentConfirmed = true;
+          writeRisk(storage, risk);
         }
-      } else if (lookup === 'not_found' && now() >= risk.expiresAt) {
-        clearRisk(storage, payerAddress, risk.signedTxId);
       }
     }
     return readRisks(storage, payerAddress);
@@ -565,25 +690,28 @@ export function createEnergyPurchaseClient(options = {}) {
 
   async function purchaseLocked(input) {
     validateAddress(input.payerAddress, 'payerAddress');
+    const risksBeforeReconciliation = readRisks(storage, input.payerAddress);
     const reconciledRisks = await reconcilePaymentRisksUnlocked(input.payerAddress);
     const previousRisk = reconciledRisks.find(risk => risk.paymentConfirmed === true) || reconciledRisks[0] || null;
-    if (previousRisk && input.acknowledgePreviousPaymentRisk !== true) {
+    if (risksBeforeReconciliation.length || previousRisk) {
       throw new EnergyPurchaseError(
         'PAYMENT_RISK_UNRESOLVED',
-        'A previous payment has an unknown result. Reconcile it before signing another payment.',
-        { paymentRisk: previousRisk }
+        previousRisk?.paymentConfirmed
+          ? 'A previous payment was recovered. Record its order result and clear the risk explicitly before another purchase.'
+          : 'A previous payment has an unknown result. Reconcile it before signing another payment.',
+        { paymentRisk: previousRisk || risksBeforeReconciliation[0] }
       );
     }
 
     input.onState?.('quoting');
     const config = input.config || (await getConfig({ signal: input.signal }));
-    const durations = Array.isArray(config?.durations)
-      ? config.durations.filter(value => typeof value === 'string' && value.trim()).map(value => value.trim())
+    const durations = Array.isArray(config?.supported_durations)
+      ? config.supported_durations.filter(value => typeof value === 'string' && value.trim()).map(value => value.trim())
       : [];
     if (typeof input.duration !== 'string' || !durations.includes(input.duration)) {
       throw new EnergyPurchaseError(
         'INVALID_DURATION',
-        'duration must be explicitly selected from the live /v1/config durations list.'
+        'duration must be explicitly selected from the live /v1/config supported_durations list.'
       );
     }
     const authoritativeQuote = await quote({ ...input, config }, { signal: input.signal });
@@ -594,11 +722,22 @@ export function createEnergyPurchaseClient(options = {}) {
       );
     }
     validatePositiveInteger(Number(input.expectedAmountSun), 'expectedAmountSun');
-    if (Number(authoritativeQuote.amount_sun) !== Number(input.expectedAmountSun)) {
+    if (Number(authoritativeQuote.total_sun) !== Number(input.expectedAmountSun)) {
       throw new EnergyPurchaseError('AMOUNT_CHANGED', 'The authoritative quote differs from the confirmed amount.', {
-        details: { amountSun: authoritativeQuote.amount_sun, expectedAmountSun: input.expectedAmountSun }
+        details: { amountSun: authoritativeQuote.total_sun, expectedAmountSun: input.expectedAmountSun }
       });
     }
+    if (typeof input.expectedPayAddress !== 'string') {
+      throw new EnergyPurchaseError(
+        'CONFIRMATION_REQUIRED',
+        'expectedPayAddress is required and must match the live configuration exactly.'
+      );
+    }
+    validateAddress(input.expectedPayAddress, 'expectedPayAddress');
+    if (authoritativeQuote.payment_address !== input.expectedPayAddress) {
+      throw new EnergyPurchaseError('PAYMENT_ADDRESS_CHANGED', 'The configured payment address differs from the confirmed address.');
+    }
+    const networkFingerprint = requireNetworkFingerprint();
 
     // Persist an intent before asking the wallet to sign. A crash or tab/process
     // exit can therefore never turn an in-flight signing decision back into
@@ -609,7 +748,8 @@ export function createEnergyPurchaseClient(options = {}) {
       state: 'preparing',
       createdAt: now(),
       expiresAt: now() + DEFAULT_PURCHASE_INTENT_TTL_MS,
-      paymentConfirmed: false
+      paymentConfirmed: false,
+      networkFingerprint
     };
     writeRisk(storage, intent);
 
@@ -618,22 +758,37 @@ export function createEnergyPurchaseClient(options = {}) {
     try {
       signed = await buildAndSignPayment({
         payerAddress: input.payerAddress,
-        payAddress: authoritativeQuote.pay_address,
-        amountSun: Number(authoritativeQuote.amount_sun),
+        payAddress: authoritativeQuote.payment_address,
+        amountSun: Number(authoritativeQuote.total_sun),
+        receivers: input.receivers,
+        energyPerReceiver: input.energyPerReceiver,
+        duration: input.duration,
         signTransaction: input.signTransaction
       });
     } catch (error) {
-      clearRisk(storage, input.payerAddress, intent.intentId);
-      throw error;
+      throw new EnergyPurchaseError(
+        'SIGNING_RESULT_UNKNOWN',
+        'The wallet signing result is unknown. The payment intent remains blocked until it is resolved explicitly.',
+        { paymentRisk: intent, cause: error }
+      );
     }
     const signedExpiration = Number(signed.raw_data?.expiration);
     const signedDeadline = Number.isFinite(signedExpiration) ? signedExpiration : now() + orderTtlMs;
     const retryDeadline = Math.min(signedDeadline, now() + paymentRetryTimeoutMs);
+    const signedRequest = {
+      receivers: [...input.receivers],
+      energy: input.energyPerReceiver,
+      duration: input.duration,
+      payer_address: input.payerAddress,
+      signed_transaction: signedTransactionForWire(signed)
+    };
+    const txId = signedRequest.signed_transaction.txID;
     const risk = {
       ...intent,
-      signedTxId: signed.txID,
+      signedTxId: txId,
       state: 'signed',
       expiresAt: signedDeadline,
+      signedRequest
     };
     writeRisk(storage, risk);
 
@@ -644,13 +799,7 @@ export function createEnergyPurchaseClient(options = {}) {
       writeRisk(storage, risk);
       try {
         order = await request('POST', ENERGY_PURCHASE_PATHS.buy, {
-          body: {
-            receivers: input.receivers,
-            energy_per_receiver: input.energyPerReceiver,
-            duration: input.duration,
-            payer_address: input.payerAddress,
-            signed_transaction: signed
-          },
+          body: signedRequest,
           signal: input.signal
         });
       } catch (error) {
@@ -659,19 +808,19 @@ export function createEnergyPurchaseClient(options = {}) {
             risk.paymentConfirmed = true;
             writeRisk(storage, risk);
             error.paymentRisk = risk;
-          } else {
-            clearRisk(storage, input.payerAddress, signed.txID);
+          } else if (shouldClearSignedRisk(error)) {
+            clearRisk(storage, input.payerAddress, txId);
           }
           throw error;
         }
         if (now() >= retryDeadline) {
-          if (await lookupTransaction(signed.txID) === 'found') {
+          if (await lookupTransaction(txId) === 'found') {
             risk.paymentConfirmed = true;
             writeRisk(storage, risk);
             return {
               ok: true,
               orderId: null,
-              txHash: signed.txID,
+              txHash: txId,
               state: 'pending',
               confirmedOnChain: true,
               paymentRisk: risk
@@ -687,17 +836,22 @@ export function createEnergyPurchaseClient(options = {}) {
       }
     }
 
-    clearRisk(storage, input.payerAddress, signed.txID);
-    const orderId = order.id;
-    const txHash = order.tx_id || signed.txID;
-    input.onOrderAccepted?.({ orderId, txHash, state: order.state || 'pending' });
+    clearRisk(storage, input.payerAddress, txId);
+    const batch = order?.batch;
+    const payment = order?.payment;
+    if (!batch || typeof batch.id !== 'string' || typeof batch.access_token !== 'string') {
+      throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy purchase response is missing batch or access token.');
+    }
+    const orderId = batch.id;
+    const txHash = payment?.tx_hash || txId;
+    input.onOrderAccepted?.({ orderId, txHash, state: batch.state || 'pending' });
     input.onState?.('delivering');
     const detail = await pollOrder(orderId, {
-      token: order.access_token,
+      token: batch.access_token,
       signal: input.signal,
       onState: input.onOrderState
     });
-    const state = detail?.state || order.state || 'pending';
+    const state = detail?.state || batch.state || 'pending';
     if (state === 'failed' || state === 'expired') {
       throw new EnergyPurchaseError('DELIVERY_FAILED', 'Payment was accepted but energy delivery failed.', {
         details: { orderId, txHash, state, detail }
@@ -721,7 +875,20 @@ export function createEnergyPurchaseClient(options = {}) {
   async function clearPaymentRisk(payerAddress, riskId) {
     validateAddress(payerAddress, 'payerAddress');
     requireRiskStorage(storage);
-    return withPayerPurchaseLock(payerAddress, paymentLock, () => clearRisk(storage, payerAddress, riskId));
+    return withPayerPurchaseLock(payerAddress, paymentLock, () => {
+      const risks = readRisks(storage, payerAddress);
+      const targets = riskId
+        ? risks.filter(risk => risk.intentId === riskId || risk.signedTxId === riskId)
+        : risks;
+      if (!targets.length) return;
+      if (targets.some(risk => risk.paymentConfirmed !== true)) {
+        throw new EnergyPurchaseError(
+          'MANUAL_RESOLUTION_REQUIRED',
+          'Only a risk confirmed by exact /buy replay can be cleared automatically; unresolved risks require operator recovery.'
+        );
+      }
+      clearRisk(storage, payerAddress, riskId);
+    });
   }
 
   return Object.freeze({

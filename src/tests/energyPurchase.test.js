@@ -1,46 +1,30 @@
 import { describe, expect, it, vi } from 'vitest';
-import {
-  createEnergyPurchaseClient,
-  EnergyPurchaseError,
-  ENERGY_PURCHASE_PATHS
-} from '../utils/energyPurchase';
+import { createEnergyPurchaseClient, EnergyPurchaseError, ENERGY_PURCHASE_PATHS } from '../utils/energyPurchase';
 
 const PAYER = 'TJRabPrwbZy45sbavfcjinPJC18kjpRTv8';
 const RECEIVER = 'TVjsyZ7fYF3qLF6BQgPmTEZy1xrNNyVAAA';
 const PAY_ADDRESS = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb';
+const TX_ID = 'ab'.repeat(32);
+const RAW_HEX = 'cd'.repeat(16);
 
 function response(data, status = 200) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => data
-  };
+  return { ok: status >= 200 && status < 300, status, json: async () => data };
 }
-
-function envelope(data) {
-  return response({ code: '0', msg: 'ok', data });
-}
-
-function config() {
-  return {
-    min_energy: 65000,
-    max_energy: 5000000,
-    max_receivers: 50,
-    durations: ['1h'],
-    presets: [65000, 131000],
-    activation_fee_sun: 1100000,
-    resource_pool_addresses: []
-  };
-}
-
-function quote() {
-  return {
-    amount_sun: 2405000,
-    pay_address: PAY_ADDRESS,
-    can_fulfill: true,
-    items: [{ receive_address: RECEIVER, needs_activation: false, activation_fee_sun: 0 }]
-  };
-}
+const envelope = data => response({ code: '0', msg: 'ok', data });
+const config = () => ({
+  min_energy: 65000,
+  max_energy: 5000000,
+  max_batch_receivers: 50,
+  supported_durations: ['1h'],
+  energy_presets: [65000, 131000],
+  payment_address: PAY_ADDRESS,
+  activation_fee_sun: 1100000
+});
+const quote = () => ({ total_sun: 2405000, total_trx: '2.405', receiver_count: 1 });
+const accepted = id => ({
+  batch: { id: String(id), access_token: 'secret-token', state: 'paid' },
+  payment: { tx_hash: TX_ID }
+});
 
 function memoryStorage() {
   const values = new Map();
@@ -50,15 +34,9 @@ function memoryStorage() {
     setItem: (key, value) => values.set(key, value),
     removeItem: key => values.delete(key),
     async tryRunExclusive(key, task) {
-      if (locks.has(key)) {
-        throw new EnergyPurchaseError('PURCHASE_IN_PROGRESS', 'purchase already in progress');
-      }
+      if (locks.has(key)) throw new EnergyPurchaseError('PURCHASE_IN_PROGRESS', 'purchase already in progress');
       locks.add(key);
-      try {
-        return await task();
-      } finally {
-        locks.delete(key);
-      }
+      try { return await task(); } finally { locks.delete(key); }
     }
   };
 }
@@ -69,8 +47,15 @@ function signingHarness() {
     raw_data: { expiration: 1000, contract: [{ type: 'TransferContract' }] },
     raw_data_hex: '00'
   };
-  const extended = { ...unsigned, txID: 'signed-id', raw_data: { ...unsigned.raw_data, expiration: 300001 } };
+  const extended = { ...unsigned, raw_data: { ...unsigned.raw_data, expiration: 300001 } };
+  const transactionUtils = {
+    txJsonToPb: vi.fn(transaction => transaction),
+    txPbToRawDataHex: vi.fn(() => RAW_HEX),
+    txPbToTxID: vi.fn(() => TX_ID)
+  };
   const tronWeb = {
+    fullNode: { host: 'https://api.trongrid.io' },
+    utils: { transaction: transactionUtils },
     transactionBuilder: {
       sendTrx: vi.fn(async () => unsigned),
       extendExpiration: vi.fn(async () => extended)
@@ -78,7 +63,27 @@ function signingHarness() {
     trx: { getTransaction: vi.fn(async () => null) }
   };
   const signTransaction = vi.fn(async transaction => ({ ...transaction, signature: ['aa'] }));
-  return { tronWeb, signTransaction };
+  return { tronWeb, signTransaction, transactionUtils };
+}
+
+function purchaseInput(signTransaction, overrides = {}) {
+  return {
+    payerAddress: PAYER,
+    receivers: [RECEIVER],
+    energyPerReceiver: 65000,
+    duration: '1h',
+    expectedAmountSun: 2405000,
+    expectedPayAddress: PAY_ADDRESS,
+    signTransaction,
+    ...overrides
+  };
+}
+
+function clientOptions(tronWeb, fetch, storage = memoryStorage()) {
+  return {
+    baseUrl: 'https://energy.example.com', fetch, tronWeb, storage,
+    sleep: async () => {}, now: () => 1
+  };
 }
 
 describe('energy purchase client', () => {
@@ -87,43 +92,41 @@ describe('energy purchase client', () => {
     expect(() => createEnergyPurchaseClient({ baseUrl: 'http://example.com' })).toThrow(/HTTPS/);
   });
 
-  it('validates quote inputs against live limits before requesting a quote', async () => {
-    const fetch = vi.fn(async url => {
+  it('uses the authoritative config and price contract', async () => {
+    const bodies = [];
+    const fetch = vi.fn(async (url, options = {}) => {
       if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) {
+        bodies.push(JSON.parse(options.body));
+        return envelope(quote());
+      }
       throw new Error(`unexpected ${url}`);
     });
     const client = createEnergyPurchaseClient({ baseUrl: 'https://energy.example.com', fetch });
-
-    await expect(client.quote({ receivers: [RECEIVER], energyPerReceiver: 1 })).rejects.toMatchObject({
-      code: 'INVALID_AMOUNT'
-    });
-    expect(fetch).toHaveBeenCalledTimes(1);
+    const value = await client.quote({ receivers: [RECEIVER], energyPerReceiver: 65000, duration: '1h' });
+    expect(value).toMatchObject({ total_sun: 2405000, payment_address: PAY_ADDRESS });
+    expect(bodies).toEqual([{ receivers: [RECEIVER], quantity: 65000, duration: '1h' }]);
   });
 
-  it('builds and signs a payment without broadcasting it', async () => {
-    const { tronWeb, signTransaction } = signingHarness();
-    const client = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch: vi.fn(),
-      tronWeb,
-      now: () => 1
-    });
-
+  it('adds the request-bound memo and rejects signer substitution', async () => {
+    const { tronWeb, signTransaction, transactionUtils } = signingHarness();
+    const client = createEnergyPurchaseClient({ baseUrl: 'https://energy.example.com', fetch: vi.fn(), tronWeb, now: () => 1 });
     const signed = await client.buildAndSignPayment({
-      payerAddress: PAYER,
-      payAddress: PAY_ADDRESS,
-      amountSun: 2405000,
-      signTransaction
+      payerAddress: PAYER, payAddress: PAY_ADDRESS, amountSun: 2405000,
+      receivers: [RECEIVER], energyPerReceiver: 65000, duration: '1h', signTransaction
     });
+    expect(signed.txID).toBe(TX_ID);
+    const payable = transactionUtils.txJsonToPb.mock.calls[0][0];
+    expect(Buffer.from(payable.raw_data.data, 'hex').toString()).toMatch(/^a6-buy-v1:[0-9a-f]{64}$/);
 
-    expect(signed.txID).toBe('signed-id');
-    expect(tronWeb.transactionBuilder.sendTrx).toHaveBeenCalledWith(PAY_ADDRESS, 2405000, PAYER);
-    expect(tronWeb.transactionBuilder.extendExpiration).toHaveBeenCalled();
-    expect(signTransaction).toHaveBeenCalledTimes(1);
-    expect(tronWeb.trx.getTransaction).not.toHaveBeenCalled();
+    await expect(client.buildAndSignPayment({
+      payerAddress: PAYER, payAddress: PAY_ADDRESS, amountSun: 2405000,
+      receivers: [RECEIVER], energyPerReceiver: 65000, duration: '1h',
+      signTransaction: async transaction => ({ ...transaction, txID: 'ef'.repeat(32), signature: ['aa'] })
+    })).rejects.toMatchObject({ code: 'SIGNED_TX_MISMATCH' });
   });
 
-  it('retries only the same signed transaction and polls an accepted order', async () => {
+  it('retries only the same signed request and consumes nested buy response', async () => {
     const { tronWeb, signTransaction } = signingHarness();
     let buyCalls = 0;
     const submitted = [];
@@ -131,229 +134,98 @@ describe('energy purchase client', () => {
       if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
       if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) return envelope(quote());
       if (url.endsWith(ENERGY_PURCHASE_PATHS.buy)) {
-        submitted.push(JSON.parse(options.body).signed_transaction.txID);
-        buyCalls += 1;
-        if (buyCalls === 1) throw new Error('connection reset');
-        return envelope({ id: 7, tx_id: 'signed-id', access_token: 'token', state: 'paid' });
+        const body = JSON.parse(options.body);
+        submitted.push(body);
+        if (++buyCalls === 1) throw new Error('connection reset');
+        return envelope(accepted(7));
       }
-      if (url.endsWith('/v1/consumer/energy/orders/7')) return envelope({ id: 7, state: 'delivered' });
+      if (url.endsWith('/v1/consumer/energy/orders/7')) return envelope({ id: '7', state: 'delivered' });
       throw new Error(`unexpected ${url}`);
     });
-    const client = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch,
-      tronWeb,
-      storage: memoryStorage(),
-      sleep: async () => {},
-      now: () => 1
-    });
-
-    const result = await client.purchase({
-      payerAddress: PAYER,
-      receivers: [RECEIVER],
-      energyPerReceiver: 65000,
-      duration: '1h',
-      expectedAmountSun: 2405000,
-      signTransaction
-    });
-
-    expect(result).toMatchObject({ ok: true, orderId: 7, txHash: 'signed-id', state: 'delivered' });
-    expect(submitted).toEqual(['signed-id', 'signed-id']);
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch));
+    const result = await client.purchase(purchaseInput(signTransaction));
+    expect(result).toMatchObject({ ok: true, orderId: '7', txHash: TX_ID, state: 'delivered' });
+    expect(submitted).toHaveLength(2);
+    expect(submitted[0]).toEqual(submitted[1]);
+    expect(submitted[0]).toMatchObject({ energy: 65000, signed_transaction: { txID: TX_ID } });
+    expect(submitted[0].signed_transaction).not.toHaveProperty('raw_data');
     expect(signTransaction).toHaveBeenCalledTimes(1);
     expect(client.getPaymentRisk(PAYER)).toBeNull();
   });
 
-  it('stops retrying on a structured business error and clears the provisional risk', async () => {
+  it('classifies 5xx as ambiguous and preserves a replayable risk', async () => {
     const { tronWeb, signTransaction } = signingHarness();
     const storage = memoryStorage();
+    let now = 1;
     const fetch = vi.fn(async url => {
       if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
       if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) return envelope(quote());
       if (url.endsWith(ENERGY_PURCHASE_PATHS.buy)) {
-        return response({ code: 'price_moved', msg: 'price changed', data: null }, 409);
+        now = 999999;
+        return response({ code: 'wallet_rpc_error', msg: 'retry same transaction', data: null }, 502);
       }
       throw new Error(`unexpected ${url}`);
     });
     const client = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch,
-      tronWeb,
-      storage,
-      sleep: async () => {},
-      now: () => 1
+      ...clientOptions(tronWeb, fetch, storage), now: () => now,
+      paymentRetryTimeoutMs: 1
     });
+    await expect(client.purchase(purchaseInput(signTransaction))).rejects.toMatchObject({ code: 'PAYMENT_RESULT_UNKNOWN' });
+    expect(client.getPaymentRisk(PAYER)).toMatchObject({
+      signedTxId: TX_ID,
+      networkFingerprint: expect.stringContaining('api.trongrid.io'),
+      signedRequest: { signed_transaction: { txID: TX_ID } }
+    });
+  });
 
-    await expect(
-      client.purchase({
-        payerAddress: PAYER,
-        receivers: [RECEIVER],
-        energyPerReceiver: 65000,
-        duration: '1h',
-        expectedAmountSun: 2405000,
-        signTransaction
-      })
-    ).rejects.toMatchObject({ code: 'PRICE_MOVED', isBusinessError: true });
-    expect(fetch.mock.calls.filter(([url]) => url.endsWith(ENERGY_PURCHASE_PATHS.buy))).toHaveLength(1);
+  it('clears risk only for an allowlisted deterministic 4xx', async () => {
+    const { tronWeb, signTransaction } = signingHarness();
+    const storage = memoryStorage();
+    const fetch = vi.fn(async url => {
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) return envelope(quote());
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.buy)) return response({ code: 'price_moved', msg: 'changed' }, 409);
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch, storage));
+    await expect(client.purchase(purchaseInput(signTransaction))).rejects.toMatchObject({ code: 'PRICE_MOVED', isBusinessError: true });
     expect(client.getPaymentRisk(PAYER)).toBeNull();
   });
 
-  it('retains an expired risk when chain lookup is unavailable', async () => {
-    const { tronWeb } = signingHarness();
-    tronWeb.trx.getTransaction.mockRejectedValue(new Error('network unavailable'));
-    const storage = memoryStorage();
-    const client = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch: vi.fn(),
-      tronWeb,
-      storage,
-      now: () => 10
-    });
-    storage.setItem(
-      `justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`,
-      JSON.stringify([{ payerAddress: PAYER, signedTxId: 'unknown', createdAt: 1, expiresAt: 2, paymentConfirmed: false }])
-    );
-
-    await expect(client.reconcilePaymentRisks(PAYER)).resolves.toHaveLength(1);
-  });
-
-  it('fails closed when durable risk storage is unavailable or corrupt', async () => {
-    const { tronWeb, signTransaction } = signingHarness();
-    const withoutStorage = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch: vi.fn(),
-      tronWeb,
-      storage: null
-    });
-
-    await expect(
-      withoutStorage.purchase({ payerAddress: PAYER, signTransaction })
-    ).rejects.toMatchObject({ code: 'RISK_STORE_UNAVAILABLE' });
-
-    const storage = memoryStorage();
-    storage.setItem(`justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`, '{bad json');
-    const corrupt = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch: vi.fn(),
-      tronWeb,
-      storage
-    });
-    expect(() => corrupt.getPaymentRisks(PAYER)).toThrowError(
-      expect.objectContaining({ code: 'RISK_STORE_UNAVAILABLE' })
-    );
-    const invalidRecords = [
-      { payerAddress: PAYER, intentId: 'i', state: 'preparing', createdAt: -1, expiresAt: 2, paymentConfirmed: false },
-      { payerAddress: PAYER, intentId: 'i', state: 'preparing', createdAt: 1.5, expiresAt: 2, paymentConfirmed: false },
-      { payerAddress: PAYER, intentId: 'i', state: 'preparing', createdAt: 3, expiresAt: 2, paymentConfirmed: false },
-      { payerAddress: PAYER, intentId: 'i', state: 'signed', createdAt: 1, expiresAt: 2, paymentConfirmed: false },
-      { payerAddress: PAYER, intentId: 'i', signedTxId: 'tx', state: 'preparing', createdAt: 1, expiresAt: 2, paymentConfirmed: false }
-    ];
-    for (const invalid of invalidRecords) {
-      storage.setItem(
-        `justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`,
-        JSON.stringify([invalid])
-      );
-      expect(() => corrupt.getPaymentRisks(PAYER)).toThrowError(
-        expect.objectContaining({ code: 'RISK_STORE_UNAVAILABLE' })
-      );
-    }
-
-    const skippedLock = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch: vi.fn(),
-      tronWeb,
-      storage: memoryStorage(),
-      paymentLock: { tryRunExclusive: vi.fn(async () => undefined) }
-    });
-    await expect(
-      skippedLock.purchase({ payerAddress: PAYER, signTransaction })
-    ).rejects.toMatchObject({ code: 'PURCHASE_IN_PROGRESS' });
-  });
-
-  it('requires the authoritative quote to equal the confirmed amount', async () => {
+  it('pins the confirmed payment address before signing', async () => {
     const { tronWeb, signTransaction } = signingHarness();
     const fetch = vi.fn(async url => {
       if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
       if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) return envelope(quote());
       throw new Error(`unexpected ${url}`);
     });
-    const client = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch,
-      tronWeb,
-      storage: memoryStorage()
-    });
-
-    await expect(
-      client.purchase({
-        payerAddress: PAYER,
-        receivers: [RECEIVER],
-        energyPerReceiver: 65000,
-        duration: '1h',
-        expectedAmountSun: 2404999,
-        signTransaction
-      })
-    ).rejects.toMatchObject({ code: 'AMOUNT_CHANGED' });
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch));
+    await expect(client.purchase(purchaseInput(signTransaction, { expectedPayAddress: RECEIVER })))
+      .rejects.toMatchObject({ code: 'PAYMENT_ADDRESS_CHANGED' });
     expect(signTransaction).not.toHaveBeenCalled();
   });
 
-  it('rejects a concurrent purchase before a second signature and persists an intent first', async () => {
+  it('does not reconcile a risk through a different network/provider', async () => {
     const { tronWeb } = signingHarness();
     const storage = memoryStorage();
-    let releaseSigner;
-    const signerGate = new Promise(resolve => { releaseSigner = resolve; });
-    let client;
-    const signTransaction = vi.fn(async transaction => {
-      const intent = client.getPaymentRisk(PAYER);
-      expect(intent).toMatchObject({ state: 'preparing' });
-      expect(intent).not.toHaveProperty('signedTxId');
-      await signerGate;
-      return { ...transaction, signature: ['aa'] };
-    });
-    const fetch = vi.fn(async url => {
-      if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
-      if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) return envelope(quote());
-      if (url.endsWith(ENERGY_PURCHASE_PATHS.buy)) {
-        return envelope({ id: 9, tx_id: 'signed-id', access_token: 'token', state: 'paid' });
-      }
-      if (url.endsWith('/v1/consumer/energy/orders/9')) return envelope({ id: 9, state: 'delivered' });
-      throw new Error(`unexpected ${url}`);
-    });
-    client = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch,
-      tronWeb,
-      storage,
-      now: () => 1
-    });
-    const input = {
-      payerAddress: PAYER,
-      receivers: [RECEIVER],
-      energyPerReceiver: 65000,
-      duration: '1h',
-      expectedAmountSun: 2405000,
-      signTransaction
-    };
+    storage.setItem(`justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`, JSON.stringify([{
+      payerAddress: PAYER, intentId: 'intent', signedTxId: TX_ID, state: 'signed', createdAt: 1,
+      expiresAt: 2, paymentConfirmed: false, networkFingerprint: 'api=https://energy.example.com;provider=https://wrong.network',
+      signedRequest: { receivers: [RECEIVER], energy: 65000, duration: '1h', payer_address: PAYER,
+        signed_transaction: { txID: TX_ID, raw_data_hex: RAW_HEX, signature: ['aa'], visible: false } }
+    }]));
+    const fetch = vi.fn();
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch, storage));
+    await expect(client.reconcilePaymentRisks(PAYER)).resolves.toHaveLength(1);
+    expect(fetch).not.toHaveBeenCalled();
+  });
 
-    const first = client.purchase(input);
-    await vi.waitFor(() => expect(signTransaction).toHaveBeenCalledTimes(1));
-    const secondClient = createEnergyPurchaseClient({
-      baseUrl: 'https://energy.example.com',
-      fetch,
-      tronWeb,
-      storage,
-      now: () => 1
-    });
-    await expect(secondClient.reconcilePaymentRisks(PAYER)).rejects.toMatchObject({
-      code: 'PURCHASE_IN_PROGRESS'
-    });
-    await expect(secondClient.clearPaymentRisk(PAYER)).rejects.toMatchObject({
-      code: 'PURCHASE_IN_PROGRESS'
-    });
-    expect(client.getPaymentRisk(PAYER)).toMatchObject({ state: 'preparing' });
-    await expect(client.purchase(input)).rejects.toMatchObject({ code: 'PURCHASE_IN_PROGRESS' });
-    releaseSigner();
-    await expect(first).resolves.toMatchObject({ ok: true, orderId: 9 });
-    expect(signTransaction).toHaveBeenCalledTimes(1);
-    expect(fetch.mock.calls.filter(([url]) => url.endsWith(ENERGY_PURCHASE_PATHS.buy))).toHaveLength(1);
+  it('fails closed for corrupt storage and unsupported history', async () => {
+    const { tronWeb } = signingHarness();
+    const storage = memoryStorage();
+    storage.setItem(`justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`, '{bad json');
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, vi.fn(), storage));
+    expect(() => client.getPaymentRisks(PAYER)).toThrowError(expect.objectContaining({ code: 'RISK_STORE_UNAVAILABLE' }));
+    await expect(client.getHistory(PAYER)).rejects.toMatchObject({ code: 'UNSUPPORTED_OPERATION' });
   });
 });

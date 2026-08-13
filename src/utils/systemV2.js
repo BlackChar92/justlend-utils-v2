@@ -351,7 +351,7 @@ export const depositTrxToVault = async (
     trxProviderProxy,
     functionSelector,
     parameters,
-    { callValue, ...options },
+    { ...options, callValue },
   );
   return result;
 };
@@ -431,7 +431,7 @@ export const supplyTrxAsCollateral = async (
     trxProviderProxy,
     functionSelector,
     parameters,
-    { callValue, ...options },
+    { ...options, callValue },
   );
   return result;
 };
@@ -607,7 +607,7 @@ export const estimateSupplyTrxGas = async (
   //function deposit(address vault, address receiver) public payable returns (uint256 shares)
   const functionSelector = "deposit(address,address)";
   const callValue = toTrxChainAmount(amount);
-  const _options = { _isConstant: true, callValue, ...options };
+  const _options = { ...options, _isConstant: true, callValue };
   const parameters = [
     { type: "address", value: vaultAddress },
     { type: "address", value: receiver },
@@ -754,7 +754,7 @@ export const depositTrxToWtrx = async (
     wtrxContractProxy,
     functionSelector,
     [],
-    { callValue, ...options },
+    { ...options, callValue },
   );
   return result;
 };

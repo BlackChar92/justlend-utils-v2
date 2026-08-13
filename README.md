@@ -97,7 +97,7 @@ tronObj.tronWeb = tronWeb;
 tronObj.defaultAccount = tronWeb.defaultAddress.base58;
 
 // Optional: pin the network instead of inferring it from the node host.
-// tronObj.network = 'nile'; // 'main' | 'nile' | 'shasta'
+// tronObj.network = 'nile'; // built-in contract addresses: 'main' | 'nile'
 
 ```
 
@@ -122,20 +122,22 @@ const energy = createEnergyPurchaseClient({
 const config = await energy.getConfig();
 const quote = await energy.quote({
   receivers: ['TReceiverAddress...'],
-  energyPerReceiver: config.presets[0],
+  energyPerReceiver: config.energy_presets[0],
+  duration: config.supported_durations[0],
   config
 });
 
 // Read-only calls are safe to use before the production write endpoint is enabled.
-console.log(quote.amount_sun, await energy.getPoolHealth());
+console.log(quote.total_sun, quote.payment_address, await energy.getPoolHealth());
 ```
 
 The `purchase()` workflow performs a fresh authoritative quote, builds a native TRX payment,
 requests a wallet signature, submits the signed transaction to the backend, and polls the order.
 It **never broadcasts the payment from the client**. Ambiguous submissions retry only the same
 signed transaction and leave a payment-risk marker that blocks silent creation of another payment.
-Call `reconcilePaymentRisks(payerAddress)` on restart or reconnect; it clears a marker only after
-history recovers the order, or after the chain definitively reports an expired transaction as absent.
+Call `reconcilePaymentRisks(payerAddress)` on restart or reconnect; it replays the exact same signed
+`/buy` request on the original API/provider fingerprint. Network changes and legacy/incomplete
+markers stay blocked until an operator resolves them explicitly.
 
 In a browser, the client uses same-origin `localStorage` plus the Web Locks API across tabs. If Web
 Locks is unavailable, pass a cross-context `paymentLock`. In Node.js there is no safe implicit
@@ -148,9 +150,10 @@ must not return until the record is durably committed. A single adapter may impl
 const result = await energy.purchase({
   payerAddress: tronWeb.defaultAddress.base58,
   receivers: ['TReceiverAddress...'],
-  energyPerReceiver: config.presets[0],
-  duration: config.durations[0],
-  expectedAmountSun: quote.amount_sun,
+  energyPerReceiver: config.energy_presets[0],
+  duration: config.supported_durations[0],
+  expectedAmountSun: quote.total_sun,
+  expectedPayAddress: quote.payment_address,
   signTransaction: unsigned => tronWeb.trx.sign(unsigned)
 });
 ```
@@ -272,12 +275,12 @@ const periods = [
   },
 ];
 
-// 1. (Optional) Pre-check: skip rounds whose merkle root isn't on-chain yet
-//    or that the user has already claimed.
+// 1. (Optional) Pre-check: the all-zero bytes32 value means the root is not
+//    published yet; read failures throw.
 const claimable = [];
 for (const p of periods) {
   const root = await getMerkleRoot(p.merkleIndex);
-  if (!root) continue;
+  if (root === `0x${'0'.repeat(64)}`) continue;
   if (await isClaimed(p.merkleIndex, p.index)) continue;
   claimable.push(p);
 }
@@ -323,7 +326,7 @@ All main methods are exported from `systemV2.js`:
 | `withdrawTrxFromWtrx` | Unwrap WTRX into native TRX via `WtrxContractProxy.withdraw()` |
 | `getLoanTokenAmountNeed` | View — preview how many loan tokens are required to seize a given amount of collateral (or to cover a given amount of borrow shares) |
 | `liquidate` | Liquidate an unhealthy position via `PublicLiquidatorProxy` (by `seizedAssets` or by `repaidShares`) |
-| `getMerkleRoot` | View — read the on-chain Merkle root for a mining round (returns `null` if not yet published) |
+| `getMerkleRoot` | View — read the on-chain Merkle root for a mining round; returns a bytes32 value (including the all-zero sentinel) and throws when the read fails |
 | `isClaimed` | View — check whether a `(merkleIndex, index)` pair has already been claimed |
 | `multiClaim` | Batch-claim V2 mining rewards across rounds; auto-selects the multi-token signature when `amount` is an array |
 

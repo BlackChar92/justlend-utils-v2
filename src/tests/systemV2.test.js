@@ -325,6 +325,33 @@ describe('justlend v2 utils systemV2', () => {
     }
   });
 
+  it('payable TRX helpers keep the validated amount authoritative over options.callValue', async () => {
+    const vaultAddress = 'TKSz9jGAqLazTbDCm7fS21Dzy7JJ5aeWoS';
+    const receiver = 'TKGRE6oiU3rEzasue4MsB6sCXXSTx9BAe3';
+    const marketParams = {
+      borrowAddress: 'TPYwAC9Y4uUcT2QH3WPPjqxzJSJWymMoMS',
+      collateralAddress: 'TYsbWxNnyTgsZaTFaue9hqpxkU3Fkco94a',
+      oracle: 'TFYLvDFSEW6dKSnWb3mt76hkHAgxPktrnG',
+      irm: 'TQYeFiTVNfJ6jfqjyfL2s93VLG1huaMEzC',
+      lltv: '0.9'
+    };
+
+    await depositTrxToVault(vaultAddress, receiver, 1, undefined, { callValue: '999999999', feeLimit: 7 });
+    expect(blockchain.triggerV2).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String), expect.any(Array), { callValue: '1000000', feeLimit: 7 }
+    );
+
+    await supplyTrxAsCollateral(marketParams, receiver, 1, undefined, { callValue: '999999999', feeLimit: 7 });
+    expect(blockchain.triggerV2).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String), expect.any(Array), { callValue: '1000000', feeLimit: 7 }
+    );
+
+    await depositTrxToWtrx(1, undefined, { callValue: '999999999', feeLimit: 7 });
+    expect(blockchain.triggerV2).toHaveBeenLastCalledWith(
+      expect.any(String), expect.any(String), expect.any(Array), { callValue: '1000000', feeLimit: 7 }
+    );
+  });
+
   it('redeemTrxFromVault (Withdraw)', async () => {
     const vaultAddress = 'TKSz9jGAqLazTbDCm7fS21Dzy7JJ5aeWoS';
     const assets = 150;
