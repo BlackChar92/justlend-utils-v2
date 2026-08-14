@@ -60,7 +60,11 @@ function signingHarness() {
       sendTrx: vi.fn(async () => unsigned),
       extendExpiration: vi.fn(async () => extended)
     },
-    trx: { getTransaction: vi.fn(async () => null) }
+    trx: {
+      getUnconfirmedTransactionInfo: vi.fn(async () => ({})),
+      getTransactionInfo: vi.fn(async () => ({})),
+      getTransaction: vi.fn(async () => null)
+    }
   };
   const signTransaction = vi.fn(async transaction => ({ ...transaction, signature: ['aa'] }));
   return { tronWeb, signTransaction, transactionUtils };
@@ -218,6 +222,60 @@ describe('energy purchase client', () => {
     const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch, storage));
     await expect(client.reconcilePaymentRisks(PAYER)).resolves.toHaveLength(1);
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('records FullNode inclusion before SolidityNode finality', async () => {
+    const { tronWeb } = signingHarness();
+    let solidified = false;
+    tronWeb.trx.getUnconfirmedTransactionInfo.mockImplementation(async () => ({
+      id: TX_ID,
+      blockNumber: 100,
+      receipt: { result: 'SUCCESS' }
+    }));
+    tronWeb.trx.getTransactionInfo.mockImplementation(async () => solidified ? {
+      id: TX_ID,
+      blockNumber: 100,
+      receipt: { result: 'SUCCESS' }
+    } : {});
+    const storage = memoryStorage();
+    storage.setItem(`justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`, JSON.stringify([{
+      payerAddress: PAYER,
+      intentId: 'intent',
+      signedTxId: TX_ID,
+      state: 'signed',
+      createdAt: 1,
+      expiresAt: 300001,
+      paymentConfirmed: false,
+      chainStatus: 'unknown',
+      chainExecution: 'unknown',
+      networkFingerprint: 'api=https://energy.example.com;provider=mainnet-provider',
+      signedRequest: {
+        receivers: [RECEIVER], energy: 65000, duration: '1h', payer_address: PAYER,
+        signed_transaction: { txID: TX_ID, raw_data_hex: RAW_HEX, signature: ['aa'], visible: false }
+      }
+    }]));
+    const fetch = vi.fn(async () => response({
+      code: 'wallet_rpc_error', msg: 'retry the same transaction', data: null
+    }, 502));
+    const client = createEnergyPurchaseClient({
+      ...clientOptions(tronWeb, fetch, storage),
+      networkFingerprint: 'mainnet-provider'
+    });
+
+    await expect(client.reconcilePaymentRisks(PAYER)).resolves.toMatchObject([{
+      paymentConfirmed: false,
+      chainStatus: 'included',
+      chainExecution: 'success'
+    }]);
+
+    solidified = true;
+    await expect(client.reconcilePaymentRisks(PAYER)).resolves.toMatchObject([{
+      paymentConfirmed: true,
+      chainStatus: 'solidified',
+      chainExecution: 'success'
+    }]);
+    expect(tronWeb.trx.getUnconfirmedTransactionInfo).toHaveBeenCalledTimes(2);
+    expect(tronWeb.trx.getTransactionInfo).toHaveBeenCalledTimes(2);
   });
 
   it('fails closed for corrupt storage and unsupported history', async () => {

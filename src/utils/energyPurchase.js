@@ -146,6 +146,22 @@ function normalizeHex(value) {
   return typeof value === 'string' ? value.replace(/^0x/i, '').toLowerCase() : '';
 }
 
+function transactionExecution(value) {
+  const result = value?.receipt?.result ?? value?.ret?.[0]?.contractRet;
+  if (typeof result !== 'string' || !result.trim()) return 'unknown';
+  return result.toUpperCase() === 'SUCCESS' ? 'success' : 'failed';
+}
+
+function hasTransactionInfo(value, txId) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const responseId = normalizeHex(value.id);
+  return responseId ? responseId === normalizeHex(txId) : Boolean(value.receipt || value.blockNumber !== undefined);
+}
+
+function isTransactionNotFound(error) {
+  return String(error?.message || error).toLowerCase().includes('transaction not found');
+}
+
 function rpcFingerprint(tronWeb) {
   const endpoints = [tronWeb?.fullNode?.host, tronWeb?.solidityNode?.host, tronWeb?.eventServer?.host]
     .filter(value => typeof value === 'string' && value.trim())
@@ -265,6 +281,10 @@ function assertRiskRecord(risk, payerAddress) {
     !validStateIdentity ||
     !validTimes ||
     typeof risk.paymentConfirmed !== 'boolean' ||
+    (risk.chainStatus !== undefined &&
+      !['unknown', 'observed', 'included', 'solidified'].includes(risk.chainStatus)) ||
+    (risk.chainExecution !== undefined &&
+      !['unknown', 'success', 'failed'].includes(risk.chainExecution)) ||
     (risk.networkFingerprint !== undefined &&
       (typeof risk.networkFingerprint !== 'string' || risk.networkFingerprint.length === 0)) ||
     (risk.signedRequest !== undefined &&
@@ -624,15 +644,64 @@ export function createEnergyPurchaseClient(options = {}) {
   }
 
   async function lookupTransaction(txId) {
-    if (!txId || typeof tronWeb?.trx?.getTransaction !== 'function') return 'unavailable';
-    try {
-      const transaction = await tronWeb.trx.getTransaction(txId);
-      return transaction?.txID === txId ? 'found' : 'not_found';
-    } catch (error) {
-      return String(error?.message || error).toLowerCase().includes('transaction not found')
-        ? 'not_found'
-        : 'unavailable';
+    if (!txId) return { status: 'unavailable', execution: 'unknown' };
+    const trx = tronWeb?.trx;
+    let attempted = 0;
+    let unavailable = false;
+    let included = null;
+
+    if (typeof trx?.getUnconfirmedTransactionInfo === 'function') {
+      attempted += 1;
+      try {
+        const info = await trx.getUnconfirmedTransactionInfo(txId);
+        if (hasTransactionInfo(info, txId)) {
+          included = { status: 'included', execution: transactionExecution(info) };
+        }
+      } catch (error) {
+        if (!isTransactionNotFound(error)) unavailable = true;
+      }
     }
+
+    if (typeof trx?.getTransactionInfo === 'function') {
+      attempted += 1;
+      try {
+        const info = await trx.getTransactionInfo(txId);
+        if (hasTransactionInfo(info, txId)) {
+          return { status: 'solidified', execution: transactionExecution(info) };
+        }
+      } catch (error) {
+        if (!isTransactionNotFound(error)) unavailable = true;
+      }
+    }
+
+    if (included) return included;
+
+    if (typeof trx?.getTransaction === 'function') {
+      attempted += 1;
+      try {
+        const transaction = await trx.getTransaction(txId);
+        if (normalizeHex(transaction?.txID) === normalizeHex(txId)) {
+          const execution = transactionExecution(transaction);
+          return { status: execution === 'unknown' ? 'observed' : 'included', execution };
+        }
+      } catch (error) {
+        if (!isTransactionNotFound(error)) unavailable = true;
+      }
+    }
+
+    return { status: attempted === 0 || unavailable ? 'unavailable' : 'not_found', execution: 'unknown' };
+  }
+
+  function recordChainLookup(risk, lookup) {
+    if (!['observed', 'included', 'solidified'].includes(lookup.status)) return;
+    const rank = { unknown: 0, observed: 1, included: 2, solidified: 3 };
+    if (rank[lookup.status] < rank[risk.chainStatus || 'unknown']) return;
+    risk.chainStatus = lookup.status;
+    if (lookup.execution !== 'unknown' || !risk.chainExecution) risk.chainExecution = lookup.execution;
+    if (lookup.status === 'solidified' && lookup.execution === 'success') {
+      risk.paymentConfirmed = true;
+    }
+    writeRisk(storage, risk);
   }
 
   async function reconcilePaymentRisksUnlocked(payerAddress) {
@@ -660,9 +729,13 @@ export function createEnergyPurchaseClient(options = {}) {
           writeRisk(storage, risk);
         } else if (shouldClearSignedRisk(error)) {
           clearRisk(storage, payerAddress, risk.signedTxId);
-        } else if (await lookupTransaction(risk.signedTxId) === 'found') {
-          risk.paymentConfirmed = true;
-          writeRisk(storage, risk);
+        } else {
+          const lookup = await lookupTransaction(risk.signedTxId);
+          if (lookup.status === 'solidified' && lookup.execution === 'failed' && !risk.paymentConfirmed) {
+            clearRisk(storage, payerAddress, risk.signedTxId);
+          } else {
+            recordChainLookup(risk, lookup);
+          }
         }
       }
     }
@@ -696,9 +769,11 @@ export function createEnergyPurchaseClient(options = {}) {
     if (risksBeforeReconciliation.length || previousRisk) {
       throw new EnergyPurchaseError(
         'PAYMENT_RISK_UNRESOLVED',
-        previousRisk?.paymentConfirmed
-          ? 'A previous payment was recovered. Record its order result and clear the risk explicitly before another purchase.'
-          : 'A previous payment has an unknown result. Reconcile it before signing another payment.',
+        previousRisk?.chainStatus === 'included' || previousRisk?.chainStatus === 'observed'
+          ? 'A previous payment is visible on FullNode but is not solidified. Do not sign another payment.'
+          : previousRisk?.paymentConfirmed
+            ? 'A previous payment was recovered or solidified. Record its order result and clear the risk explicitly before another purchase.'
+            : 'A previous payment has an unknown result. Reconcile it before signing another payment.',
         { paymentRisk: previousRisk || risksBeforeReconciliation[0] }
       );
     }
@@ -749,6 +824,8 @@ export function createEnergyPurchaseClient(options = {}) {
       createdAt: now(),
       expiresAt: now() + DEFAULT_PURCHASE_INTENT_TTL_MS,
       paymentConfirmed: false,
+      chainStatus: 'unknown',
+      chainExecution: 'unknown',
       networkFingerprint
     };
     writeRisk(storage, intent);
@@ -814,15 +891,37 @@ export function createEnergyPurchaseClient(options = {}) {
           throw error;
         }
         if (now() >= retryDeadline) {
-          if (await lookupTransaction(txId) === 'found') {
-            risk.paymentConfirmed = true;
-            writeRisk(storage, risk);
+          const lookup = await lookupTransaction(txId);
+          if (['observed', 'included', 'solidified'].includes(lookup.status)) {
+            if (lookup.status === 'solidified' && lookup.execution === 'failed') {
+              clearRisk(storage, input.payerAddress, txId);
+              throw new EnergyPurchaseError(
+                'PAYMENT_FAILED_ON_CHAIN',
+                'The signed payment failed in a solidified block and was not accepted as payment.',
+                {
+                  retryable: false,
+                  cause: error,
+                  details: { txId, chainStatus: lookup.status, chainExecution: lookup.execution }
+                }
+              );
+            }
+            recordChainLookup(risk, lookup);
+            if (lookup.execution === 'failed') {
+              throw new EnergyPurchaseError(
+                'PAYMENT_RESULT_UNKNOWN',
+                'FullNode reports a failed execution, but the block is not solidified. Do not sign another payment yet.',
+                { retryable: false, paymentRisk: risk, cause: error }
+              );
+            }
             return {
               ok: true,
               orderId: null,
               txHash: txId,
               state: 'pending',
-              confirmedOnChain: true,
+              observedOnChain: true,
+              confirmedOnChain: lookup.status === 'solidified',
+              chainStatus: lookup.status,
+              chainExecution: lookup.execution,
               paymentRisk: risk
             };
           }
@@ -884,7 +983,7 @@ export function createEnergyPurchaseClient(options = {}) {
       if (targets.some(risk => risk.paymentConfirmed !== true)) {
         throw new EnergyPurchaseError(
           'MANUAL_RESOLUTION_REQUIRED',
-          'Only a risk confirmed by exact /buy replay can be cleared automatically; unresolved risks require operator recovery.'
+          'Only a payment accepted by exact /buy replay or proven solidified can be cleared automatically; unresolved risks require operator recovery.'
         );
       }
       clearRisk(storage, payerAddress, riskId);

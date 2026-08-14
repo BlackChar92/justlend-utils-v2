@@ -137,7 +137,9 @@ It **never broadcasts the payment from the client**. Ambiguous submissions retry
 signed transaction and leave a payment-risk marker that blocks silent creation of another payment.
 Call `reconcilePaymentRisks(payerAddress)` on restart or reconnect; it replays the exact same signed
 `/buy` request on the original API/provider fingerprint. Network changes and legacy/incomplete
-markers stay blocked until an operator resolves them explicitly.
+markers stay blocked until an operator resolves them explicitly. Reconciled records expose
+`chainStatus` (`observed`/`included` from FullNode, then `solidified` from SolidityNode) and
+`chainExecution`; unavailable or missing RPC evidence never permits a new signature.
 
 In a browser, the client uses same-origin `localStorage` plus the Web Locks API across tabs. If Web
 Locks is unavailable, pass a cross-context `paymentLock`. In Node.js there is no safe implicit
