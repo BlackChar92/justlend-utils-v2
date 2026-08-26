@@ -50,14 +50,42 @@ export const getDefaultAccount = () => {
 };
 
 export const getNetworkType = () => {
-  // An explicit override always wins over host sniffing.
-  if (tronObj.network) return tronObj.network;
-  const host = tronObj.tronWeb?.fullNode?.host || "";
-  if (host.includes("nile")) return "nile"; // https://nile.trongrid.io
-  if (host.includes("shasta")) return "shasta"; // https://api.shasta.trongrid.io
-  // Mainnet hosts (https://api.trongrid.io, https://api.tronstack.io) and any
-  // unrecognized host fall through to main.
-  return "main";
+  // An explicit, validated override wins over host inference. This is required
+  // for operator-controlled proxies/private nodes whose hostname does not prove
+  // which chain they serve.
+  if (tronObj.network !== null && tronObj.network !== undefined && tronObj.network !== "") {
+    const explicit = String(tronObj.network).trim().toLowerCase();
+    if (!["main", "nile", "shasta"].includes(explicit)) {
+      throw new Error(
+        `Unsupported tronObj.network "${tronObj.network}": expected main, nile, or shasta`,
+      );
+    }
+    return explicit;
+  }
+
+  const host = tronObj.tronWeb?.fullNode?.host;
+  if (typeof host !== "string" || !host.trim()) {
+    throw new Error(
+      "Unable to infer TRON network from an empty provider host; set tronObj.network explicitly",
+    );
+  }
+
+  let hostname;
+  try {
+    hostname = new URL(host).hostname.toLowerCase();
+  } catch {
+    throw new Error(
+      `Unable to infer TRON network from provider host "${host}"; set tronObj.network explicitly`,
+    );
+  }
+
+  if (["api.trongrid.io", "api.tronstack.io"].includes(hostname)) return "main";
+  if (hostname === "nile.trongrid.io") return "nile";
+  if (["api.shasta.trongrid.io", "shasta.trongrid.io"].includes(hostname)) return "shasta";
+
+  throw new Error(
+    `Unknown TRON provider host "${hostname}"; set tronObj.network explicitly before using contract helpers`,
+  );
 };
 
 export const triggerSmartContract = async (

@@ -15,6 +15,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { tronObj, getNetworkType, getDefaultAccount } from '../utils/blockchain';
+import { getContractsAddress } from '../utils/systemV2';
 
 describe('getNetworkType', () => {
   const realTronWeb = tronObj.tronWeb;
@@ -50,9 +51,32 @@ describe('getNetworkType', () => {
     expect(getNetworkType()).toBe('nile');
   });
 
-  it('tolerates a missing/unset host', () => {
+  it('fails closed for a missing/unset host', () => {
     tronObj.tronWeb = {};
-    expect(getNetworkType()).toBe('main');
+    expect(() => getNetworkType()).toThrow(/empty provider host.*set tronObj\.network/i);
+  });
+
+  it('fails closed for an unrecognized or lookalike host', () => {
+    withHost('https://wallet-proxy.example.com');
+    expect(() => getNetworkType()).toThrow(/Unknown TRON provider host/i);
+    withHost('https://api.trongrid.io.attacker.example');
+    expect(() => getNetworkType()).toThrow(/Unknown TRON provider host/i);
+  });
+
+  it('rejects invalid explicit network overrides', () => {
+    withHost('https://api.trongrid.io');
+    tronObj.network = 'mainnet';
+    expect(() => getNetworkType()).toThrow(/expected main, nile, or shasta/i);
+  });
+
+  it('requires a configured contract registry for the selected network', () => {
+    tronObj.network = 'shasta';
+    expect(() => getContractsAddress('MoolahProxy')).toThrow(/No contract registry.*shasta/i);
+  });
+
+  it('does not resolve a mainnet proxy for an unknown injected provider', () => {
+    withHost('https://wallet-proxy.example.com');
+    expect(() => getContractsAddress('MoolahProxy')).toThrow(/Unknown TRON provider host/i);
   });
 });
 

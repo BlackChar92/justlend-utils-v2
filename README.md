@@ -135,9 +135,15 @@ The `purchase()` workflow performs a fresh authoritative quote, builds a native 
 requests a wallet signature, submits the signed transaction to the backend, and polls the order.
 It **never broadcasts the payment from the client**. Ambiguous submissions retry only the same
 signed transaction and leave a payment-risk marker that blocks silent creation of another payment.
-Call `reconcilePaymentRisks(payerAddress)` on restart or reconnect; it replays the exact same signed
-`/buy` request on the original API/provider fingerprint. Network changes and legacy/incomplete
-markers stay blocked until an operator resolves them explicitly. Reconciled records expose
+Risk storage contains metadata only (`signedTxId`, status, timestamps, and network fingerprint),
+never the signed body or an order access token. In the same client session, call
+`reconcilePaymentRisks(payerAddress)` for read-only chain reconciliation. Replaying the in-memory
+signed request requires an explicit `reconcilePaymentRisks(payerAddress, { confirmReplay: true })`
+call, and every risk API verifies that `payerAddress` matches the current `tronWeb.defaultAddress`
+(or the client-level `payerAddress` / `getCurrentPayerAddress` binding). After a restart the signed
+body is intentionally unavailable; the metadata marker remains blocked until chain evidence or an
+operator recovery process resolves it. Network changes and legacy/incomplete markers also stay
+blocked. Reconciled records expose
 `chainStatus` (`observed`/`included` from FullNode, then `solidified` from SolidityNode) and
 `chainExecution`; unavailable or missing RPC evidence never permits a new signature.
 
@@ -161,6 +167,9 @@ const result = await energy.purchase({
 ```
 
 Do not log or persist `signed_transaction`: anyone who obtains it may broadcast it before expiry.
+The default browser storage is used only for non-replayable risk metadata; legacy records containing
+`signedRequest` are scrubbed when the client initializes with a current payer (or on the first risk
+read when the payer is supplied dynamically) after upgrading.
 
 ### 3. Contract Interactions
 

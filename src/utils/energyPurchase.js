@@ -260,6 +260,27 @@ function riskStoreError(message, cause) {
   return new EnergyPurchaseError('RISK_STORE_UNAVAILABLE', message, { cause });
 }
 
+function recoveredOrderMetadata(order) {
+  if (!order || typeof order !== 'object' || Array.isArray(order)) return undefined;
+  const batch = order.batch && typeof order.batch === 'object' && !Array.isArray(order.batch)
+    ? {
+        id: order.batch.id,
+        state: order.batch.state
+      }
+    : undefined;
+  const payment = order.payment && typeof order.payment === 'object' && !Array.isArray(order.payment)
+    ? { tx_hash: order.payment.tx_hash }
+    : undefined;
+  return { ...(batch ? { batch } : {}), ...(payment ? { payment } : {}) };
+}
+
+/** Strip every replayable credential before a risk crosses the storage/API boundary. */
+function metadataOnlyRisk(risk) {
+  const { signedRequest: _signedRequest, recoveredOrder, ...metadata } = risk || {};
+  const safeRecoveredOrder = recoveredOrderMetadata(recoveredOrder);
+  return safeRecoveredOrder ? { ...metadata, recoveredOrder: safeRecoveredOrder } : metadata;
+}
+
 function assertRiskRecord(risk, payerAddress) {
   const hasIntentId = typeof risk?.intentId === 'string' && risk.intentId.length > 0;
   const hasSignedTxId = typeof risk?.signedTxId === 'string' && risk.signedTxId.length > 0;
@@ -287,9 +308,6 @@ function assertRiskRecord(risk, payerAddress) {
       !['unknown', 'success', 'failed'].includes(risk.chainExecution)) ||
     (risk.networkFingerprint !== undefined &&
       (typeof risk.networkFingerprint !== 'string' || risk.networkFingerprint.length === 0)) ||
-    (risk.signedRequest !== undefined &&
-      (!risk.signedRequest || typeof risk.signedRequest !== 'object' ||
-        risk.signedRequest?.signed_transaction?.txID !== risk.signedTxId)) ||
     (risk.state !== undefined && !['preparing', 'signed'].includes(risk.state))
   ) {
     throw riskStoreError('Energy payment risk storage contains an invalid record.');
@@ -328,7 +346,16 @@ function readRisks(storage, payerAddress) {
     const value = JSON.parse(raw);
     const risks = Array.isArray(value) ? value : value && typeof value === 'object' ? [value] : null;
     if (!risks) throw new Error('expected an array or object');
-    return risks.map(risk => assertRiskRecord(risk, payerAddress));
+    const containedReplayablePayload = risks.some(
+      risk => risk && typeof risk === 'object' && Object.prototype.hasOwnProperty.call(risk, 'signedRequest')
+    );
+    const safeRisks = risks.map(risk => assertRiskRecord(metadataOnlyRisk(risk), payerAddress));
+    // Migrate legacy records in place on first read so an old signed body does
+    // not remain recoverable from localStorage after upgrading the SDK.
+    if (containedReplayablePayload) {
+      storage.setItem(riskKey(payerAddress), JSON.stringify(safeRisks));
+    }
+    return safeRisks;
   } catch (cause) {
     if (cause instanceof EnergyPurchaseError) throw cause;
     throw riskStoreError('Energy payment risk storage is corrupt or has an invalid schema.', cause);
@@ -337,33 +364,39 @@ function readRisks(storage, payerAddress) {
 
 function writeRisk(storage, risk) {
   requireRiskStorage(storage);
-  assertRiskRecord(risk, risk.payerAddress);
-  const risks = readRisks(storage, risk.payerAddress);
+  const safeRisk = metadataOnlyRisk(risk);
+  assertRiskRecord(safeRisk, safeRisk.payerAddress);
+  const risks = readRisks(storage, safeRisk.payerAddress);
   const sameRisk = item =>
-    (risk.intentId && item.intentId === risk.intentId) ||
-    (risk.signedTxId && item.signedTxId === risk.signedTxId);
+    (safeRisk.intentId && item.intentId === safeRisk.intentId) ||
+    (safeRisk.signedTxId && item.signedTxId === safeRisk.signedTxId);
   const next = risks.filter(item => !sameRisk(item));
-  next.push(risk);
+  next.push(safeRisk);
   try {
-    storage.setItem(riskKey(risk.payerAddress), JSON.stringify(next));
+    storage.setItem(riskKey(safeRisk.payerAddress), JSON.stringify(next));
   } catch (cause) {
     throw riskStoreError('Energy payment risk storage could not be written.', cause);
   }
-  return risk;
+  return safeRisk;
 }
 
 function clearRisk(storage, payerAddress, riskId) {
   requireRiskStorage(storage);
   try {
+    const risks = readRisks(storage, payerAddress);
+    const removed = riskId
+      ? risks.filter(risk => risk.signedTxId === riskId || risk.intentId === riskId)
+      : risks;
     if (!riskId) {
       storage.removeItem(riskKey(payerAddress));
-      return;
+      return removed;
     }
-    const remaining = readRisks(storage, payerAddress).filter(
+    const remaining = risks.filter(
       risk => risk.signedTxId !== riskId && risk.intentId !== riskId
     );
     if (remaining.length) storage.setItem(riskKey(payerAddress), JSON.stringify(remaining));
     else storage.removeItem(riskKey(payerAddress));
+    return removed;
   } catch (cause) {
     if (cause instanceof EnergyPurchaseError) throw cause;
     throw riskStoreError('Energy payment risk storage could not be updated.', cause);
@@ -500,6 +533,75 @@ export function createEnergyPurchaseClient(options = {}) {
   const explicitNetworkFingerprint = typeof options.networkFingerprint === 'string'
     ? options.networkFingerprint.trim()
     : '';
+  // Full signed requests are deliberately short-lived and process-local. Only
+  // non-replayable metadata is persisted through `storage`.
+  const signedRequests = new Map();
+
+  function replayKey(risk) {
+    return risk?.intentId || risk?.signedTxId || '';
+  }
+
+  function rememberSignedRequest(risk, signedRequest) {
+    const key = replayKey(risk);
+    if (!key) throw new EnergyPurchaseError('INVALID_PAYMENT_INTENT', 'Signed payment risk is missing a recovery key.');
+    signedRequests.set(key, signedRequest);
+  }
+
+  function forgetSignedRequests(risks) {
+    for (const risk of risks || []) {
+      const key = replayKey(risk);
+      if (key) signedRequests.delete(key);
+    }
+  }
+
+  function clearStoredRisk(payerAddress, riskId) {
+    const removed = clearRisk(storage, payerAddress, riskId);
+    forgetSignedRequests(removed);
+    return removed;
+  }
+
+  function publicRisk(risk) {
+    const metadata = metadataOnlyRisk(risk);
+    return { ...metadata, replayAvailable: signedRequests.has(replayKey(metadata)) };
+  }
+
+  function assertCurrentPayer(payerAddress) {
+    const configured = typeof options.getCurrentPayerAddress === 'function'
+      ? options.getCurrentPayerAddress()
+      : options.payerAddress || tronWeb?.defaultAddress?.base58;
+    if (configured && typeof configured.then === 'function') {
+      throw new EnergyPurchaseError(
+        'PAYER_BINDING_REQUIRED',
+        'getCurrentPayerAddress must return the active wallet address synchronously.'
+      );
+    }
+    if (typeof configured !== 'string' || !configured) {
+      throw new EnergyPurchaseError(
+        'PAYER_BINDING_REQUIRED',
+        'Energy payment recovery requires a current wallet binding via tronWeb.defaultAddress.base58, payerAddress, or getCurrentPayerAddress.'
+      );
+    }
+    validateAddress(configured, 'current wallet address');
+    if (configured !== payerAddress) {
+      throw new EnergyPurchaseError(
+        'PAYER_MISMATCH',
+        'The requested payer does not match the current wallet session.'
+      );
+    }
+    return configured;
+  }
+
+  // Browser upgrades scrub a legacy signedRequest as soon as the client can
+  // identify the active payer, rather than waiting for an explicit risk call.
+  const initialPayer = options.payerAddress || tronWeb?.defaultAddress?.base58;
+  if (
+    typeof initialPayer === 'string' && initialPayer &&
+    storage && typeof storage.getItem === 'function' &&
+    typeof storage.setItem === 'function' && typeof storage.removeItem === 'function'
+  ) {
+    validateAddress(initialPayer, 'current wallet address');
+    readRisks(storage, initialPayer);
+  }
 
   function currentNetworkFingerprint() {
     const provider = explicitNetworkFingerprint || rpcFingerprint(tronWeb);
@@ -523,6 +625,7 @@ export function createEnergyPurchaseClient(options = {}) {
     try {
       response = await fetchImpl(`${baseUrl}${path}`, {
         method,
+        redirect: 'error',
         headers: {
           ...(requestOptions.body === undefined ? {} : { 'Content-Type': 'application/json' }),
           ...(requestOptions.token ? { 'X-Consumer-Order-Token': requestOptions.token } : {})
@@ -614,6 +717,7 @@ export function createEnergyPurchaseClient(options = {}) {
       throw new EnergyPurchaseError('CONFIG_MISSING', 'signTransaction callback is required.');
     }
     validateAddress(payerAddress, 'payerAddress');
+    assertCurrentPayer(payerAddress);
     validateAddress(payAddress, 'payAddress');
     validatePositiveInteger(Number(amountSun), 'amountSun');
     validatePositiveInteger(Number(energyPerReceiver), 'energyPerReceiver');
@@ -704,39 +808,49 @@ export function createEnergyPurchaseClient(options = {}) {
     writeRisk(storage, risk);
   }
 
-  async function reconcilePaymentRisksUnlocked(payerAddress) {
+  async function reconcilePaymentRisksUnlocked(payerAddress, reconcileOptions = {}) {
     validateAddress(payerAddress, 'payerAddress');
     const risks = readRisks(storage, payerAddress);
     const fingerprint = currentNetworkFingerprint();
+    const confirmReplay = reconcileOptions.confirmReplay === true;
     for (const risk of risks) {
       // Legacy/preparing records deliberately stay blocked: they do not contain
       // enough immutable evidence to prove that no signature escaped.
-      if (!risk.signedTxId || !risk.signedRequest || !risk.networkFingerprint) {
+      if (!risk.signedTxId || !risk.networkFingerprint) {
         continue;
       }
       if (!fingerprint || risk.networkFingerprint !== fingerprint) continue;
-      try {
-        const recoveredOrder = await request('POST', ENERGY_PURCHASE_PATHS.buy, { body: risk.signedRequest });
-        // Keep an accepted/recovered marker until the caller explicitly records
-        // the returned order and clears it. Automatically clearing here would
-        // let purchase() sign a second payment in the same invocation.
-        risk.paymentConfirmed = true;
-        risk.recoveredOrder = recoveredOrder;
-        writeRisk(storage, risk);
-      } catch (error) {
-        if (error.code === 'TX_ALREADY_CLAIMED') {
+      const signedRequest = signedRequests.get(replayKey(risk));
+      if (confirmReplay && signedRequest && risk.paymentConfirmed !== true) {
+        try {
+          const recoveredOrder = await request('POST', ENERGY_PURCHASE_PATHS.buy, { body: signedRequest });
+          // Keep an accepted/recovered marker until the caller explicitly records
+          // the returned order and clears it. Automatically clearing here would
+          // let purchase() sign a second payment in the same invocation.
           risk.paymentConfirmed = true;
+          risk.recoveredOrder = recoveredOrderMetadata(recoveredOrder);
           writeRisk(storage, risk);
-        } else if (shouldClearSignedRisk(error)) {
-          clearRisk(storage, payerAddress, risk.signedTxId);
-        } else {
-          const lookup = await lookupTransaction(risk.signedTxId);
-          if (lookup.status === 'solidified' && lookup.execution === 'failed' && !risk.paymentConfirmed) {
-            clearRisk(storage, payerAddress, risk.signedTxId);
-          } else {
-            recordChainLookup(risk, lookup);
+          signedRequests.delete(replayKey(risk));
+          continue;
+        } catch (error) {
+          if (error.code === 'TX_ALREADY_CLAIMED') {
+            risk.paymentConfirmed = true;
+            writeRisk(storage, risk);
+            signedRequests.delete(replayKey(risk));
+            continue;
+          } else if (shouldClearSignedRisk(error)) {
+            clearStoredRisk(payerAddress, risk.signedTxId);
+            continue;
           }
+          // Ambiguous replay failures fall through to read-only chain evidence.
         }
+      }
+
+      const lookup = await lookupTransaction(risk.signedTxId);
+      if (lookup.status === 'solidified' && lookup.execution === 'failed' && !risk.paymentConfirmed) {
+        clearStoredRisk(payerAddress, risk.signedTxId);
+      } else {
+        recordChainLookup(risk, lookup);
       }
     }
     return readRisks(storage, payerAddress);
@@ -763,7 +877,11 @@ export function createEnergyPurchaseClient(options = {}) {
 
   async function purchaseLocked(input) {
     validateAddress(input.payerAddress, 'payerAddress');
+    assertCurrentPayer(input.payerAddress);
     const risksBeforeReconciliation = readRisks(storage, input.payerAddress);
+    // Starting a new purchase only performs read-only chain reconciliation.
+    // Replaying an older signed body requires the caller to invoke the explicit
+    // recovery API with confirmReplay=true.
     const reconciledRisks = await reconcilePaymentRisksUnlocked(input.payerAddress);
     const previousRisk = reconciledRisks.find(risk => risk.paymentConfirmed === true) || reconciledRisks[0] || null;
     if (risksBeforeReconciliation.length || previousRisk) {
@@ -864,9 +982,9 @@ export function createEnergyPurchaseClient(options = {}) {
       ...intent,
       signedTxId: txId,
       state: 'signed',
-      expiresAt: signedDeadline,
-      signedRequest
+      expiresAt: signedDeadline
     };
+    rememberSignedRequest(risk, signedRequest);
     writeRisk(storage, risk);
 
     input.onState?.('submitting');
@@ -886,7 +1004,7 @@ export function createEnergyPurchaseClient(options = {}) {
             writeRisk(storage, risk);
             error.paymentRisk = risk;
           } else if (shouldClearSignedRisk(error)) {
-            clearRisk(storage, input.payerAddress, txId);
+            clearStoredRisk(input.payerAddress, txId);
           }
           throw error;
         }
@@ -894,7 +1012,7 @@ export function createEnergyPurchaseClient(options = {}) {
           const lookup = await lookupTransaction(txId);
           if (['observed', 'included', 'solidified'].includes(lookup.status)) {
             if (lookup.status === 'solidified' && lookup.execution === 'failed') {
-              clearRisk(storage, input.payerAddress, txId);
+              clearStoredRisk(input.payerAddress, txId);
               throw new EnergyPurchaseError(
                 'PAYMENT_FAILED_ON_CHAIN',
                 'The signed payment failed in a solidified block and was not accepted as payment.',
@@ -935,7 +1053,7 @@ export function createEnergyPurchaseClient(options = {}) {
       }
     }
 
-    clearRisk(storage, input.payerAddress, txId);
+    clearStoredRisk(input.payerAddress, txId);
     const batch = order?.batch;
     const payment = order?.payment;
     if (!batch || typeof batch.id !== 'string' || typeof batch.access_token !== 'string') {
@@ -961,18 +1079,26 @@ export function createEnergyPurchaseClient(options = {}) {
 
   async function purchase(input) {
     validateAddress(input?.payerAddress, 'payerAddress');
+    assertCurrentPayer(input.payerAddress);
     requireRiskStorage(storage);
     return withPayerPurchaseLock(input.payerAddress, paymentLock, () => purchaseLocked(input));
   }
 
-  async function reconcilePaymentRisks(payerAddress) {
+  async function reconcilePaymentRisks(payerAddress, reconcileOptions = {}) {
     validateAddress(payerAddress, 'payerAddress');
+    assertCurrentPayer(payerAddress);
     requireRiskStorage(storage);
-    return withPayerPurchaseLock(payerAddress, paymentLock, () => reconcilePaymentRisksUnlocked(payerAddress));
+    const risks = await withPayerPurchaseLock(
+      payerAddress,
+      paymentLock,
+      () => reconcilePaymentRisksUnlocked(payerAddress, reconcileOptions)
+    );
+    return risks.map(publicRisk);
   }
 
   async function clearPaymentRisk(payerAddress, riskId) {
     validateAddress(payerAddress, 'payerAddress');
+    assertCurrentPayer(payerAddress);
     requireRiskStorage(storage);
     return withPayerPurchaseLock(payerAddress, paymentLock, () => {
       const risks = readRisks(storage, payerAddress);
@@ -986,7 +1112,7 @@ export function createEnergyPurchaseClient(options = {}) {
           'Only a payment accepted by exact /buy replay or proven solidified can be cleared automatically; unresolved risks require operator recovery.'
         );
       }
-      clearRisk(storage, payerAddress, riskId);
+      clearStoredRisk(payerAddress, riskId);
     });
   }
 
@@ -1003,11 +1129,14 @@ export function createEnergyPurchaseClient(options = {}) {
     purchase,
     getPaymentRisk: payerAddress => {
       validateAddress(payerAddress, 'payerAddress');
-      return readRisk(storage, payerAddress);
+      assertCurrentPayer(payerAddress);
+      const risk = readRisk(storage, payerAddress);
+      return risk ? publicRisk(risk) : null;
     },
     getPaymentRisks: payerAddress => {
       validateAddress(payerAddress, 'payerAddress');
-      return readRisks(storage, payerAddress);
+      assertCurrentPayer(payerAddress);
+      return readRisks(storage, payerAddress).map(publicRisk);
     },
     reconcilePaymentRisks,
     clearPaymentRisk

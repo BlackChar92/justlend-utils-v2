@@ -54,6 +54,7 @@ function signingHarness() {
     txPbToTxID: vi.fn(() => TX_ID)
   };
   const tronWeb = {
+    defaultAddress: { base58: PAYER },
     fullNode: { host: 'https://api.trongrid.io' },
     utils: { transaction: transactionUtils },
     transactionBuilder: {
@@ -98,7 +99,9 @@ describe('energy purchase client', () => {
 
   it('uses the authoritative config and price contract', async () => {
     const bodies = [];
+    const redirects = [];
     const fetch = vi.fn(async (url, options = {}) => {
+      redirects.push(options.redirect);
       if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
       if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) {
         bodies.push(JSON.parse(options.body));
@@ -110,6 +113,7 @@ describe('energy purchase client', () => {
     const value = await client.quote({ receivers: [RECEIVER], energyPerReceiver: 65000, duration: '1h' });
     expect(value).toMatchObject({ total_sun: 2405000, payment_address: PAY_ADDRESS });
     expect(bodies).toEqual([{ receivers: [RECEIVER], quantity: 65000, duration: '1h' }]);
+    expect(redirects).toEqual(['error', 'error']);
   });
 
   it('adds the request-bound memo and rejects signer substitution', async () => {
@@ -178,8 +182,64 @@ describe('energy purchase client', () => {
     expect(client.getPaymentRisk(PAYER)).toMatchObject({
       signedTxId: TX_ID,
       networkFingerprint: expect.stringContaining('api.trongrid.io'),
-      signedRequest: { signed_transaction: { txID: TX_ID } }
+      replayAvailable: true
     });
+    expect(client.getPaymentRisk(PAYER)).not.toHaveProperty('signedRequest');
+    const persisted = storage.getItem(`justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`);
+    expect(persisted).not.toContain(RAW_HEX);
+    expect(persisted).not.toContain('signature');
+  });
+
+  it('replays only after explicit confirmation and only for the current wallet', async () => {
+    const { tronWeb, signTransaction } = signingHarness();
+    const storage = memoryStorage();
+    let now = 1;
+    let recoveryEnabled = false;
+    let buyCalls = 0;
+    const fetch = vi.fn(async url => {
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) return envelope(quote());
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.buy)) {
+        buyCalls += 1;
+        if (!recoveryEnabled) {
+          now = 999999;
+          return response({ code: 'wallet_rpc_error', msg: 'retry same transaction', data: null }, 502);
+        }
+        return envelope(accepted(8));
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = createEnergyPurchaseClient({
+      ...clientOptions(tronWeb, fetch, storage),
+      now: () => now,
+      paymentRetryTimeoutMs: 1
+    });
+
+    await expect(client.purchase(purchaseInput(signTransaction))).rejects.toMatchObject({ code: 'PAYMENT_RESULT_UNKNOWN' });
+    const callsAfterPurchase = buyCalls;
+    await client.reconcilePaymentRisks(PAYER);
+    expect(buyCalls).toBe(callsAfterPurchase);
+
+    recoveryEnabled = true;
+    const [recovered] = await client.reconcilePaymentRisks(PAYER, { confirmReplay: true });
+    expect(buyCalls).toBe(callsAfterPurchase + 1);
+    expect(recovered).toMatchObject({
+      paymentConfirmed: true,
+      replayAvailable: false,
+      recoveredOrder: { batch: { id: '8', state: 'paid' } }
+    });
+    expect(recovered).not.toHaveProperty('signedRequest');
+    expect(recovered.recoveredOrder.batch).not.toHaveProperty('access_token');
+  });
+
+  it('rejects payment-risk access for a payer outside the current wallet session', async () => {
+    const { tronWeb } = signingHarness();
+    const otherPayer = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb';
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, vi.fn()));
+
+    expect(() => client.getPaymentRisks(otherPayer)).toThrowError(expect.objectContaining({ code: 'PAYER_MISMATCH' }));
+    await expect(client.reconcilePaymentRisks(otherPayer, { confirmReplay: true }))
+      .rejects.toMatchObject({ code: 'PAYER_MISMATCH' });
   });
 
   it('clears risk only for an allowlisted deterministic 4xx', async () => {
@@ -222,6 +282,9 @@ describe('energy purchase client', () => {
     const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch, storage));
     await expect(client.reconcilePaymentRisks(PAYER)).resolves.toHaveLength(1);
     expect(fetch).not.toHaveBeenCalled();
+    const migrated = storage.getItem(`justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`);
+    expect(migrated).not.toContain(RAW_HEX);
+    expect(migrated).not.toContain('signedRequest');
   });
 
   it('records FullNode inclusion before SolidityNode finality', async () => {
@@ -282,8 +345,9 @@ describe('energy purchase client', () => {
     const { tronWeb } = signingHarness();
     const storage = memoryStorage();
     storage.setItem(`justlend_energy_purchase_risk:${encodeURIComponent(PAYER)}`, '{bad json');
-    const client = createEnergyPurchaseClient(clientOptions(tronWeb, vi.fn(), storage));
-    expect(() => client.getPaymentRisks(PAYER)).toThrowError(expect.objectContaining({ code: 'RISK_STORE_UNAVAILABLE' }));
+    expect(() => createEnergyPurchaseClient(clientOptions(tronWeb, vi.fn(), storage)))
+      .toThrowError(expect.objectContaining({ code: 'RISK_STORE_UNAVAILABLE' }));
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, vi.fn(), memoryStorage()));
     await expect(client.getHistory(PAYER)).rejects.toMatchObject({ code: 'UNSUPPORTED_OPERATION' });
   });
 });

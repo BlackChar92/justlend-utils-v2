@@ -29,9 +29,18 @@ import Config from "../config";
 
 const { trxPrecision, contracts, resetToZeroTokens = [] } = Config;
 
-const getContractsAddress = (type) => {
- return contracts[getNetworkType()]?.[type]
-}
+export const getContractsAddress = (type) => {
+  const network = getNetworkType();
+  const registry = contracts[network];
+  if (!registry) {
+    throw new Error(`No contract registry is configured for TRON network "${network}"`);
+  }
+  const address = registry[type];
+  if (!address) {
+    throw new Error(`No ${type} contract is configured for TRON network "${network}"`);
+  }
+  return address;
+};
 
 const assertAddress = (address, label) => {
   assertTronAddress(address, label);
