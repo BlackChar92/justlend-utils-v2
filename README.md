@@ -97,11 +97,81 @@ tronObj.tronWeb = tronWeb;
 tronObj.defaultAccount = tronWeb.defaultAddress.base58;
 
 // Optional: pin the network instead of inferring it from the node host.
-// tronObj.network = 'nile'; // 'main' | 'nile' | 'shasta'
+// tronObj.network = 'nile'; // built-in contract addresses: 'main' | 'nile'
 
 ```
 
-### 2. Contract Interactions
+### 2. Energy direct purchase (explicit API configuration)
+
+Energy direct purchase uses a separately deployed API. The library deliberately does not provide a
+production URL or economic fallbacks: inject the URL, then load limits, durations, prices, and pool
+capacity from the live API.
+
+```javascript
+import { createEnergyPurchaseClient } from 'justlend-v2-utils';
+
+const energy = createEnergyPurchaseClient({
+  baseUrl: process.env.JUSTLEND_ENERGY_API_URL,
+  tronWeb,
+  // Required in Node.js: use a durable store shared by every process.
+  storage: durableRiskStorage,
+  // Required in Node.js: an atomic, non-waiting file/DB lock provider.
+  paymentLock: durablePaymentLock
+});
+
+const config = await energy.getConfig();
+const quote = await energy.quote({
+  receivers: ['TReceiverAddress...'],
+  energyPerReceiver: config.energy_presets[0],
+  duration: config.supported_durations[0],
+  config
+});
+
+// Read-only calls are safe to use before the production write endpoint is enabled.
+console.log(quote.total_sun, quote.payment_address, await energy.getPoolHealth());
+```
+
+The `purchase()` workflow performs a fresh authoritative quote, builds a native TRX payment,
+requests a wallet signature, submits the signed transaction to the backend, and polls the order.
+It **never broadcasts the payment from the client**. Ambiguous submissions retry only the same
+signed transaction and leave a payment-risk marker that blocks silent creation of another payment.
+Risk storage contains metadata only (`signedTxId`, status, timestamps, and network fingerprint),
+never the signed body or an order access token. In the same client session, call
+`reconcilePaymentRisks(payerAddress)` for read-only chain reconciliation. Replaying the in-memory
+signed request requires an explicit `reconcilePaymentRisks(payerAddress, { confirmReplay: true })`
+call, and every risk API verifies that `payerAddress` matches the current `tronWeb.defaultAddress`
+(or the client-level `payerAddress` / `getCurrentPayerAddress` binding). After a restart the signed
+body is intentionally unavailable; the metadata marker remains blocked until chain evidence or an
+operator recovery process resolves it. Network changes and legacy/incomplete markers also stay
+blocked. Reconciled records expose
+`chainStatus` (`observed`/`included` from FullNode, then `solidified` from SolidityNode) and
+`chainExecution`; unavailable or missing RPC evidence never permits a new signature.
+
+In a browser, the client uses same-origin `localStorage` plus the Web Locks API across tabs. If Web
+Locks is unavailable, pass a cross-context `paymentLock`. In Node.js there is no safe implicit
+fallback: provide durable `storage` (`getItem`/`setItem`/`removeItem`) and a `paymentLock` exposing
+`tryRunExclusive(key, task)`. The lock must be shared by all processes and **fail immediately** when
+already held; it must not queue a duplicate purchase. Storage methods are synchronous: `setItem`
+must not return until the record is durably committed. A single adapter may implement both APIs.
+
+```javascript
+const result = await energy.purchase({
+  payerAddress: tronWeb.defaultAddress.base58,
+  receivers: ['TReceiverAddress...'],
+  energyPerReceiver: config.energy_presets[0],
+  duration: config.supported_durations[0],
+  expectedAmountSun: quote.total_sun,
+  expectedPayAddress: quote.payment_address,
+  signTransaction: unsigned => tronWeb.trx.sign(unsigned)
+});
+```
+
+Do not log or persist `signed_transaction`: anyone who obtains it may broadcast it before expiry.
+The default browser storage is used only for non-replayable risk metadata; legacy records containing
+`signedRequest` are scrubbed when the client initializes with a current payer (or on the first risk
+read when the payer is supplied dynamically) after upgrading.
+
+### 3. Contract Interactions
 
 **Deposit to Vault**
 
@@ -122,7 +192,7 @@ const handleDeposit = async () => {
   // 2. Approve if needed
   if (allowance.lt(chainAmount)) {
     console.log("Approving...");
-    await approve(assetAddress, vaultAddress);
+    await approve(assetAddress, vaultAddress, { amount: chainAmount });
   }
 
   // 3. Deposit
@@ -152,8 +222,8 @@ const tx = await supplyCollateral(
   marketParams,
   "50", // amount
   18,   // decimals
-  "TMoolahContractAddress...", // JustLend Moolah contract
-  "TUserAddress..."    // User address
+  "TUserAddress...",          // onBehalf
+  "TMoolahContractAddress..." // optional JustLend Moolah proxy override
 );
 
 ```
@@ -165,6 +235,8 @@ import { getLoanTokenAmountNeed, liquidate, approve, getAllowance, Config } from
 
 const marketId = '0x...'; // bytes32 — fetched from Moolah `getId(marketParams)`
 const borrower = 'TBorrowerAddress...';
+const loanTokenAddr = 'TLoanTokenAddress...';
+const userAddr = 'TYourAddress...';
 const seizedAssets = '50';   // collateral to seize (human-readable)
 const decimals = 18;
 
@@ -176,7 +248,7 @@ console.log('Loan tokens required:', need.toString());
 const liquidatorAddr = Config.contracts.main.PublicLiquidatorProxy;
 const allowance = await getAllowance(loanTokenAddr, userAddr, liquidatorAddr);
 if (allowance.lt(need)) {
-  await approve(loanTokenAddr, liquidatorAddr);
+  await approve(loanTokenAddr, liquidatorAddr, { amount: need.toFixed(0) });
 }
 
 // 3. Execute the liquidation
@@ -214,12 +286,12 @@ const periods = [
   },
 ];
 
-// 1. (Optional) Pre-check: skip rounds whose merkle root isn't on-chain yet
-//    or that the user has already claimed.
+// 1. (Optional) Pre-check: the all-zero bytes32 value means the root is not
+//    published yet; read failures throw.
 const claimable = [];
 for (const p of periods) {
   const root = await getMerkleRoot(p.merkleIndex);
-  if (!root) continue;
+  if (root === `0x${'0'.repeat(64)}`) continue;
   if (await isClaimed(p.merkleIndex, p.index)) continue;
   claimable.push(p);
 }
@@ -237,7 +309,7 @@ await multiClaim(
 );
 ```
 
-### 3. Helpers
+### 4. Helpers
 
 ```javascript
 import { formatNumber, toChainAmount } from 'justlend-v2-utils';
@@ -265,7 +337,7 @@ All main methods are exported from `systemV2.js`:
 | `withdrawTrxFromWtrx` | Unwrap WTRX into native TRX via `WtrxContractProxy.withdraw()` |
 | `getLoanTokenAmountNeed` | View — preview how many loan tokens are required to seize a given amount of collateral (or to cover a given amount of borrow shares) |
 | `liquidate` | Liquidate an unhealthy position via `PublicLiquidatorProxy` (by `seizedAssets` or by `repaidShares`) |
-| `getMerkleRoot` | View — read the on-chain Merkle root for a mining round (returns `null` if not yet published) |
+| `getMerkleRoot` | View — read the on-chain Merkle root for a mining round; returns a bytes32 value (including the all-zero sentinel) and throws when the read fails |
 | `isClaimed` | View — check whether a `(merkleIndex, index)` pair has already been claimed |
 | `multiClaim` | Batch-claim V2 mining rewards across rounds; auto-selects the multi-token signature when `amount` is an array |
 

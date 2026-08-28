@@ -16,4 +16,5 @@
 export * from './utils/systemV2';
 export * from './utils/blockchain';
 export * from './utils/helper';
+export * from './utils/energyPurchase';
 export { default as Config } from './config';

@@ -29,9 +29,18 @@ import Config from "../config";
 
 const { trxPrecision, contracts, resetToZeroTokens = [] } = Config;
 
-const getContractsAddress = (type) => {
- return contracts[getNetworkType()]?.[type]
-}
+export const getContractsAddress = (type) => {
+  const network = getNetworkType();
+  const registry = contracts[network];
+  if (!registry) {
+    throw new Error(`No contract registry is configured for TRON network "${network}"`);
+  }
+  const address = registry[type];
+  if (!address) {
+    throw new Error(`No ${type} contract is configured for TRON network "${network}"`);
+  }
+  return address;
+};
 
 const assertAddress = (address, label) => {
   assertTronAddress(address, label);
@@ -351,7 +360,7 @@ export const depositTrxToVault = async (
     trxProviderProxy,
     functionSelector,
     parameters,
-    { callValue, ...options },
+    { ...options, callValue },
   );
   return result;
 };
@@ -431,7 +440,7 @@ export const supplyTrxAsCollateral = async (
     trxProviderProxy,
     functionSelector,
     parameters,
-    { callValue, ...options },
+    { ...options, callValue },
   );
   return result;
 };
@@ -508,7 +517,16 @@ export const repayWithTrx = async (
   } = marketParams;
   const assets = toTrxChainAmount(amount);
   let callValue = assets;
-  if (sharesCallValueAmount) callValue = sharesCallValueAmount;
+  if (sharesCallValueAmount != null) {
+    // `sharesCallValueAmount` is already expressed in SUN, but it is still a
+    // uint256 transaction value. Route it through the same non-negative,
+    // finite-integer boundary used by every other raw chain amount.
+    const rawCallValue = new BigNumber(sharesCallValueAmount);
+    if (!rawCallValue.isFinite() || !rawCallValue.isInteger() || rawCallValue.lt(0)) {
+      throw new Error(`repayWithTrx: invalid sharesCallValueAmount ${sharesCallValueAmount}`);
+    }
+    callValue = toChainAmount(rawCallValue, 0);
+  }
 
   const parameters = [
     {
@@ -531,7 +549,9 @@ export const repayWithTrx = async (
     trxProviderProxy,
     functionSelector,
     parameters,
-    {callValue, ...options},
+    // The validated value is authoritative; callers cannot replace it through
+    // options.callValue after the uint256 boundary guard.
+    {...options, callValue},
   );
   return result;
 };
@@ -596,7 +616,7 @@ export const estimateSupplyTrxGas = async (
   //function deposit(address vault, address receiver) public payable returns (uint256 shares)
   const functionSelector = "deposit(address,address)";
   const callValue = toTrxChainAmount(amount);
-  const _options = { _isConstant: true, callValue, ...options };
+  const _options = { ...options, _isConstant: true, callValue };
   const parameters = [
     { type: "address", value: vaultAddress },
     { type: "address", value: receiver },
@@ -743,7 +763,7 @@ export const depositTrxToWtrx = async (
     wtrxContractProxy,
     functionSelector,
     [],
-    { callValue, ...options },
+    { ...options, callValue },
   );
   return result;
 };

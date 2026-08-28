@@ -16,7 +16,10 @@
 import bigNumber from "bignumber.js";
 import { tronObj } from "./blockchain";
 
-const tronWeb = tronObj.tronWeb;
+// Resolve the current provider at call time. Browser integrations replace
+// tronObj.tronWeb after connecting a wallet; module-scope caching would keep
+// reads pointed at the fallback RPC/network.
+const getTronWeb = () => tronObj.tronWeb;
 
 bigNumber.config({ EXPONENTIAL_AT: 1e9 });
 bigNumber.prototype._toFixed = function (...arg) {
@@ -34,18 +37,18 @@ bigNumber.prototype._toHex = function () {
   return `0x${this.toString(16)}`;
 };
 
-export const toBigNumber = tronWeb.toBigNumber;
+export const toBigNumber = (...args) => getTronWeb().toBigNumber(...args);
 
 export const BigNumber = bigNumber;
 
-export const toDecimal = tronWeb.toDecimal;
+export const toDecimal = (...args) => getTronWeb().toDecimal(...args);
 
 export const getTrxBalance = async (address) => {
-  return await tronWeb.trx.getUnconfirmedBalance(address);
+  return await getTronWeb().trx.getUnconfirmedBalance(address);
 };
 
 export const getAccount = async (address) => {
-  return await tronWeb.trx.getAccount(address);
+  return await getTronWeb().trx.getAccount(address);
 };
 
 export const formatNumber = (
@@ -107,6 +110,7 @@ export const formatNumber = (
     }
   }
 
+  const tronWeb = getTronWeb();
   tronWeb.BigNumber.config({
     ROUNDING_MODE: tronWeb.BigNumber.ROUND_HALF_UP,
     FORMAT: {

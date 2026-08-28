@@ -13,8 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { describe, it, expect } from 'vitest';
-import { formatNumber, toChainAmount } from '../utils/helper';
+import { describe, it, expect, afterEach } from 'vitest';
+import { formatNumber, getAccount, getTrxBalance, toChainAmount } from '../utils/helper';
+import { tronObj } from '../utils/blockchain';
+
+const originalProvider = tronObj.tronWeb;
+
+afterEach(() => {
+  tronObj.tronWeb = originalProvider;
+});
 
 describe('formatNumber', () => {
   it('formats integer with commas', () => {
@@ -42,5 +49,43 @@ describe('toChainAmount', () => {
     expect(() => toChainAmount('1', NaN)).toThrow(/invalid decimals/);
     expect(() => toChainAmount('1', -1)).toThrow(/invalid decimals/);
     expect(() => toChainAmount('abc', 6)).toThrow(/invalid amount/);
+  });
+});
+
+describe('provider binding', () => {
+  it('resolves account and balance helpers against a provider injected after import', async () => {
+    const originalCalls = [];
+    originalProvider.trx.getAccount = async (address) => {
+      originalCalls.push(['account', address]);
+      return { provider: 'original' };
+    };
+    originalProvider.trx.getUnconfirmedBalance = async (address) => {
+      originalCalls.push(['balance', address]);
+      return '111';
+    };
+    const injectedCalls = [];
+    tronObj.tronWeb = {
+      toBigNumber: originalProvider.toBigNumber,
+      toDecimal: originalProvider.toDecimal,
+      BigNumber: originalProvider.BigNumber,
+      trx: {
+        getAccount: async (address) => {
+          injectedCalls.push(['account', address]);
+          return { provider: 'injected' };
+        },
+        getUnconfirmedBalance: async (address) => {
+          injectedCalls.push(['balance', address]);
+          return '222';
+        },
+      },
+    };
+
+    await expect(getAccount('TInjectedAccount')).resolves.toEqual({ provider: 'injected' });
+    await expect(getTrxBalance('TInjectedBalance')).resolves.toBe('222');
+    expect(originalCalls).toEqual([]);
+    expect(injectedCalls).toEqual([
+      ['account', 'TInjectedAccount'],
+      ['balance', 'TInjectedBalance'],
+    ]);
   });
 });
