@@ -134,7 +134,7 @@ describe('energy purchase client', () => {
     })).rejects.toMatchObject({ code: 'SIGNED_TX_MISMATCH' });
   });
 
-  it('retries only the same signed request and consumes nested buy response', async () => {
+  it('retries only the same signed request and retains an accepted-payment marker', async () => {
     const { tronWeb, signTransaction } = signingHarness();
     let buyCalls = 0;
     const submitted = [];
@@ -152,13 +152,45 @@ describe('energy purchase client', () => {
     });
     const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch));
     const result = await client.purchase(purchaseInput(signTransaction));
-    expect(result).toMatchObject({ ok: true, orderId: '7', txHash: TX_ID, state: 'delivered' });
+    expect(result).toMatchObject({
+      ok: true,
+      orderId: '7',
+      txHash: TX_ID,
+      state: 'delivered',
+      paymentRisk: { paymentConfirmed: true, signedTxId: TX_ID }
+    });
     expect(submitted).toHaveLength(2);
     expect(submitted[0]).toEqual(submitted[1]);
     expect(submitted[0]).toMatchObject({ energy: 65000, signed_transaction: { txID: TX_ID } });
     expect(submitted[0].signed_transaction).not.toHaveProperty('raw_data');
     expect(signTransaction).toHaveBeenCalledTimes(1);
+    await expect(client.purchase(purchaseInput(signTransaction))).rejects.toMatchObject({
+      code: 'PAYMENT_RISK_UNRESOLVED'
+    });
+    expect(signTransaction).toHaveBeenCalledTimes(1);
+    await client.clearPaymentRisk(PAYER, result.paymentRisk.intentId);
     expect(client.getPaymentRisk(PAYER)).toBeNull();
+  });
+
+  it('preserves the signed-risk marker when a nominal buy response is malformed', async () => {
+    const { tronWeb, signTransaction } = signingHarness();
+    const storage = memoryStorage();
+    const fetch = vi.fn(async url => {
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.config)) return envelope(config());
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.quote)) return envelope(quote());
+      if (url.endsWith(ENERGY_PURCHASE_PATHS.buy)) return envelope({});
+      throw new Error(`unexpected ${url}`);
+    });
+    const client = createEnergyPurchaseClient(clientOptions(tronWeb, fetch, storage));
+
+    await expect(client.purchase(purchaseInput(signTransaction))).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE',
+      paymentRisk: { signedTxId: TX_ID, paymentConfirmed: false }
+    });
+    await expect(client.purchase(purchaseInput(signTransaction))).rejects.toMatchObject({
+      code: 'PAYMENT_RISK_UNRESOLVED'
+    });
+    expect(signTransaction).toHaveBeenCalledTimes(1);
   });
 
   it('classifies 5xx as ambiguous and preserves a replayable risk', async () => {

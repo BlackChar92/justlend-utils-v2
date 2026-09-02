@@ -146,6 +146,9 @@ operator recovery process resolves it. Network changes and legacy/incomplete mar
 blocked. Reconciled records expose
 `chainStatus` (`observed`/`included` from FullNode, then `solidified` from SolidityNode) and
 `chainExecution`; unavailable or missing RPC evidence never permits a new signature.
+Even a successful `purchase()` retains a confirmed payment marker until the application has
+durably recorded its order result. The returned `paymentRisk` identifies that marker; after
+recording the result, explicitly clear it before beginning another purchase.
 
 In a browser, the client uses same-origin `localStorage` plus the Web Locks API across tabs. If Web
 Locks is unavailable, pass a cross-context `paymentLock`. In Node.js there is no safe implicit
@@ -164,6 +167,9 @@ const result = await energy.purchase({
   expectedPayAddress: quote.payment_address,
   signTransaction: unsigned => tronWeb.trx.sign(unsigned)
 });
+
+await persistAcceptedOrder(result);
+await energy.clearPaymentRisk(tronWeb.defaultAddress.base58, result.paymentRisk.intentId);
 ```
 
 Do not log or persist `signed_transaction`: anyone who obtains it may broadcast it before expiry.
