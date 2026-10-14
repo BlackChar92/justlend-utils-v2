@@ -21,7 +21,7 @@ import BigNumber from 'bignumber.js';
 
 describe('justlend v2 utils systemV2', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
     global.window = {
       defaultAccount: 'TKGRE6oiU3rEzasue4MsB6sCXXSTx9BAe3'
     };
@@ -42,8 +42,8 @@ describe('justlend v2 utils systemV2', () => {
     });
     vi.spyOn(blockchain, 'triggerEnergy').mockResolvedValue({ energy_used: 31000 });
 
-    // Read paths go through `view`, which already returns [] on any network
-    // error, so the getter tests fall back to their safe defaults offline.
+    // Keep reads offline as well and reset queued one-shot results per test.
+    vi.spyOn(blockchain, 'view').mockResolvedValue([]);
   });
 
   it('depositToVault', async () => {
@@ -774,6 +774,7 @@ describe('justlend v2 utils systemV2', () => {
   });
 
   it('getMerkleRoot', async () => {
+    blockchain.tronObj.network = 'main';
     const merkleIndex = 0;
     vi.spyOn(blockchain, 'view').mockResolvedValueOnce([
       'a'.repeat(64),
@@ -786,7 +787,8 @@ describe('justlend v2 utils systemV2', () => {
 
   it('getMerkleRoot (custom merkleDistributor address)', async () => {
     const merkleIndex = 0;
-    const merkleDistributor = Config.contracts.nile.MerkleDistributor;
+    // Address fixture only: no assumed Nile reward deployment.
+    const merkleDistributor = 'TKGRE6oiU3rEzasue4MsB6sCXXSTx9BAe3';
     vi.spyOn(blockchain, 'view').mockResolvedValueOnce([
       'b'.repeat(64),
     ]);
@@ -794,9 +796,13 @@ describe('justlend v2 utils systemV2', () => {
     const root = await getMerkleRoot(merkleIndex, merkleDistributor);
 
     expect(root).toBe(`0x${'b'.repeat(64)}`);
+    expect(blockchain.view).toHaveBeenCalledWith(
+      merkleDistributor, expect.any(String), expect.any(Array),
+    );
   });
 
   it('isClaimed', async () => {
+    blockchain.tronObj.network = 'main';
     const merkleIndex = 0;
     const index = 0;
     vi.spyOn(blockchain, 'view').mockResolvedValueOnce(['1']);
@@ -808,6 +814,7 @@ describe('justlend v2 utils systemV2', () => {
   });
 
   it('merkle reads fail closed instead of returning not-found sentinels', async () => {
+    blockchain.tronObj.network = 'main';
     vi.spyOn(blockchain, 'view').mockResolvedValue([]);
     await expect(getMerkleRoot(0)).rejects.toThrow(/Failed to read merkle root/);
     await expect(isClaimed(0, 1)).rejects.toThrow(/Failed to read claim status/);
@@ -821,6 +828,7 @@ describe('justlend v2 utils systemV2', () => {
   });
 
   it('multiClaim (single token)', async () => {
+    blockchain.tronObj.network = 'main';
     const claims = [
       {
         merkleIndex: '0',
@@ -832,7 +840,7 @@ describe('justlend v2 utils systemV2', () => {
       },
     ];
 
-    await multiClaim(claims).catch(() => {});
+    await multiClaim(claims);
 
     expect(blockchain.triggerV2).toHaveBeenCalledWith(
       expect.any(String),
@@ -1006,7 +1014,7 @@ describe('justlend v2 utils systemV2', () => {
     );
   });
 
-  it('multiClaim (multi-token / NEW USDD)', async () => {
+  it('multiClaim (explicit custom multi-token distributor)', async () => {
     const claims = [
       {
         merkleIndex: '0',
@@ -1017,9 +1025,10 @@ describe('justlend v2 utils systemV2', () => {
         ],
       },
     ];
-    const merkleDistributor = Config.contracts.nile.MerkleDistributor;
+    // Address fixture only: no assumed Nile reward deployment.
+    const merkleDistributor = 'TKGRE6oiU3rEzasue4MsB6sCXXSTx9BAe3';
 
-    await multiClaim(claims, merkleDistributor).catch(() => {});
+    await multiClaim(claims, merkleDistributor);
 
     expect(blockchain.triggerV2).toHaveBeenCalledWith(
       merkleDistributor,

@@ -179,6 +179,21 @@ read when the payer is supplied dynamically) after upgrading.
 
 ### 3. Contract Interactions
 
+Nile rewards have no default distributor. Pass an explicitly verified Nile
+distributor to `getMerkleRoot`, `isClaimed`, or `multiClaim`, otherwise they throw
+before any RPC or transaction construction. They never fall back to mainnet.
+
+Raw `shares`, `sharesAmount`, and `repaidShares` are unscaled integers in
+`0..2^256-1`. Use a string, bigint, or BigNumber for values above
+`Number.MAX_SAFE_INTEGER`; unsafe numbers, fractions, empty strings, and unsupported
+types are rejected. Omitted, null, or zero shares select asset mode. For vault
+redemptions, `repay`, liquidation quotes, and `liquidate`, pass zero or omit assets
+when using nonzero shares; conflicting amounts throw instead of silently ignoring
+assets. In `repayWithTrx` share mode, `amount` is instead an independent human-TRX
+funding budget. An explicit `sharesCallValueAmount` is raw SUN and remains
+authoritative, including when `amount` is null. TRX asset amounts always use
+6 decimals, regardless of the vault share decimals.
+
 **Deposit to Vault**
 
 ```javascript
@@ -425,7 +440,7 @@ const Config = {
     nile: {
       MoolahProxy: 'TFgrgsd8c37ByaZx1YxpBzazJS8bHsoP5c',
       TrxProviderProxy: 'TMRZwenUVHPvnxhwDDQLY4SEmmwXvtKRjz',
-      MerkleDistributor: 'TKQ5VVJPsoZDD7NqQ8ffhFwzeRp45XLSGt',
+      // No default reward distributor; pass a verified Nile deployment explicitly.
       PublicLiquidatorProxy: 'TLvPrXHVQCA54gLQjLfoNi5XQ6WqhXCEps',
       WtrxContractProxy: 'TYsbWxNnyTgsZaTFaue9hqpxkU3Fkco94a',
     },
