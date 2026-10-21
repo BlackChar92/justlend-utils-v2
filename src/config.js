@@ -17,6 +17,7 @@ const TRUSTED_TRONGRID_HOSTS = new Set([
   'api.trongrid.io',
   'api.tronstack.io',
   'nile.trongrid.io',
+  'api.nileex.io',
   'api.shasta.trongrid.io',
   'shasta.trongrid.io',
 ]);

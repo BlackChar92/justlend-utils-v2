@@ -80,7 +80,7 @@ export const getNetworkType = () => {
   }
 
   if (["api.trongrid.io", "api.tronstack.io"].includes(hostname)) return "main";
-  if (hostname === "nile.trongrid.io") return "nile";
+  if (["nile.trongrid.io", "api.nileex.io"].includes(hostname)) return "nile";
   if (["api.shasta.trongrid.io", "shasta.trongrid.io"].includes(hostname)) return "shasta";
 
   throw new Error(

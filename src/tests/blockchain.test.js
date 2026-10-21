@@ -16,6 +16,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { tronObj, getNetworkType, getDefaultAccount } from '../utils/blockchain';
 import { getContractsAddress } from '../utils/systemV2';
+import Config, { validateTrustedFullHost } from '../config';
 
 describe('getNetworkType', () => {
   const realTronWeb = tronObj.tronWeb;
@@ -31,6 +32,32 @@ describe('getNetworkType', () => {
   it('infers nile from the node host', () => {
     withHost('https://nile.trongrid.io');
     expect(getNetworkType()).toBe('nile');
+  });
+
+  it.each([
+    ['https://api.trongrid.io', 'main'],
+    ['https://api.tronstack.io', 'main'],
+    ['https://nile.trongrid.io', 'nile'],
+    ['https://api.nileex.io', 'nile'],
+    ['https://api.shasta.trongrid.io', 'shasta'],
+    ['https://shasta.trongrid.io', 'shasta'],
+  ])('accepts and consistently identifies the official endpoint %s', (host, network) => {
+    expect(validateTrustedFullHost(`${host}/`)).toBe(host);
+    withHost(host);
+    expect(getNetworkType()).toBe(network);
+  });
+
+  it('resolves Nile contracts for the official RPC alias instead of mainnet defaults', () => {
+    withHost('https://api.nileex.io');
+    expect(getContractsAddress('MoolahProxy')).toBe(Config.contracts.nile.MoolahProxy);
+    expect(getContractsAddress('MoolahProxy')).not.toBe(Config.contracts.main.MoolahProxy);
+  });
+
+  it('does not trust or infer a network from a Nile-alias lookalike', () => {
+    const host = 'https://api.nileex.io.attacker.example';
+    expect(() => validateTrustedFullHost(host)).toThrow(/Untrusted/);
+    withHost(host);
+    expect(() => getNetworkType()).toThrow(/Unknown TRON provider host/i);
   });
 
   it('infers shasta from the node host (no longer mislabeled as main)', () => {
