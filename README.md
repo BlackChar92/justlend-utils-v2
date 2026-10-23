@@ -9,7 +9,7 @@
 <p align="center">
   <a href="./LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
   <a href="https://tron.network/"><img alt="TRON Network" src="https://img.shields.io/badge/Network-TRON-red"></a>
-  <a href="https://nodejs.org/"><img alt="Node.js >=20" src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?logo=nodedotjs&amp;logoColor=white"></a>
+  <a href="https://nodejs.org/"><img alt="Recommended Node.js 24.22.1" src="https://img.shields.io/badge/Node.js-24.22.1-339933?logo=nodedotjs&amp;logoColor=white"></a>
   <a href="https://justlend.org/"><img alt="Protocol: JustLend DAO" src="https://img.shields.io/badge/Protocol-JustLend_DAO-green"></a>
   <a href="https://github.com/justlend/justlend-utils-v2/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/justlend/justlend-utils-v2/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push"></a>
 </p>
@@ -398,11 +398,14 @@ All main methods are exported from `systemV2.js`:
 
 ## Development
 
+Recommended development and CI baseline: **Node.js 24.22.1**, pinned in `.nvmrc`.
+Use `nvm install && nvm use` to select the recommended version.
+
 If you want to contribute or run the example app locally.
 
 **Prerequisites**
 
-* Node.js 20 or later
+* Node.js **24.22.1** (recommended)
 * TronLink Wallet Extension (for frontend interaction)
 
 **Installation & Running**
