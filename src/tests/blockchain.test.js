@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { describe, it, expect, afterEach } from 'vitest';
-import { tronObj, getNetworkType, getDefaultAccount } from '../utils/blockchain';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { tronObj, getNetworkType, getDefaultAccount, triggerV2 } from '../utils/blockchain';
 import { getContractsAddress } from '../utils/systemV2';
 
 describe('getNetworkType', () => {
@@ -115,5 +115,69 @@ describe('getDefaultAccount', () => {
 
   it('throws a clear error when nothing is configured (Node, no window)', () => {
     expect(() => getDefaultAccount()).toThrow(/No sender address configured/);
+  });
+});
+
+describe('broadcast error privacy', () => {
+  const realTronWeb = tronObj.tronWeb;
+  let log;
+  let broadcast;
+  const signed = {
+    txID: 'audit-transaction',
+    raw_data_hex: 'AUDIT_NOT_RAW_TRANSACTION_DATA',
+    signature: ['AUDIT_NOT_A_VALID_SIGNATURE'],
+  };
+
+  beforeEach(() => {
+    log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    broadcast = vi.fn();
+    tronObj.defaultAccount = 'TKGRE6oiU3rEzasue4MsB6sCXXSTx9BAe3';
+    tronObj.tronWeb = {
+      address: { toHex: (address) => address },
+      transactionBuilder: {
+        triggerSmartContract: vi.fn(async () => ({ result: { result: true }, transaction: { txID: 'unsigned' } })),
+        triggerConstantContract: vi.fn(async () => ({ constant_result: ['00'] })),
+      },
+      trx: {
+        sign: vi.fn(async () => signed),
+        sendRawTransaction: broadcast,
+      },
+    };
+  });
+
+  afterEach(() => {
+    tronObj.tronWeb = realTronWeb;
+    tronObj.defaultAccount = null;
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ['SERVER_BUSY', 'SERVER_BUSY'],
+    ['A', 'A'],
+    ['X'.repeat(63), 'X'.repeat(63)],
+    ['X'.repeat(64), 'X'.repeat(64)],
+    ['', 'broadcast rejected by node'],
+    [undefined, 'broadcast rejected by node'],
+    [{ nested: signed }, 'broadcast rejected by node'],
+    ['BAD\nCODE', 'broadcast rejected by node'],
+    ['lowercase', 'broadcast rejected by node'],
+    ['X'.repeat(65), 'broadcast rejected by node'],
+  ])(
+    'does not expose signed fields or arbitrary messages when the node rejects with code %j',
+    async (code, reason) => {
+      broadcast.mockResolvedValue({ result: false, code, message: JSON.stringify(signed), transaction: signed });
+      await expect(triggerV2(tronObj.defaultAccount, 'audit()')).rejects.toThrow(`Broadcast failed: ${reason}`);
+      expect(log).toHaveBeenCalledWith(`triggerV2 error: Broadcast failed: ${reason}`);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(signed.signature[0]);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(signed.raw_data_hex);
+      expect(broadcast).toHaveBeenCalledWith(signed);
+    },
+  );
+
+  it('preserves successful SDK responses without logging them', async () => {
+    const result = { result: true, transaction: signed };
+    broadcast.mockResolvedValue(result);
+    await expect(triggerV2(tronObj.defaultAccount, 'audit()')).resolves.toBe(result);
+    expect(log).not.toHaveBeenCalled();
   });
 });
