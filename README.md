@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://app.justlend.org/">
-    <img src="https://app.justlend.org/mainLogo.svg" alt="JustLend DAO Logo" width="180">
+    <img src="https://app.justlend.org/mainLogo.svg" alt="JustLend Logo" width="180">
   </a>
 </p>
 
@@ -10,7 +10,7 @@
   <a href="./LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
   <a href="https://tron.network/"><img alt="TRON Network" src="https://img.shields.io/badge/Network-TRON-red"></a>
   <a href="https://nodejs.org/"><img alt="Recommended Node.js 24.22.1" src="https://img.shields.io/badge/Node.js-24.22.1-339933?logo=nodedotjs&amp;logoColor=white"></a>
-  <a href="https://justlend.org/"><img alt="Protocol: JustLend DAO" src="https://img.shields.io/badge/Protocol-JustLend_DAO-green"></a>
+  <a href="https://justlend.org/"><img alt="Protocol: JustLend" src="https://img.shields.io/badge/Protocol-JustLend-green"></a>
   <a href="https://github.com/justlend/justlend-utils-v2/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/justlend/justlend-utils-v2/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push"></a>
 </p>
 
@@ -531,3 +531,31 @@ const Config = {
 
 This project is licensed under the **Apache License 2.0**.
 See the [LICENSE](./LICENSE) file for the full license text.
+
+## Read-only liquidation permission diagnostics
+
+```javascript
+import { getLiquidationPermissionDiagnostics } from 'justlend-v2-utils';
+
+const diagnostics = await getLiquidationPermissionDiagnostics({
+  marketId, borrower, caller
+});
+console.log(diagnostics.checks, diagnostics.unavailable);
+```
+
+This optional helper reads five separate observations: the core flag for the
+caller, the core flag for the PublicLiquidator route, the zero-address core flag,
+the PublicLiquidator market flag, and its borrower-specific flag. Missing,
+malformed or failed reads return `null`, not permission denied/allowed. It never
+signs, submits, modifies permissions, or automatically calls `liquidate`.
+
+These selectors reflect the investigation in issue #3, not proof that deployed
+implementations match upstream source. The helper intentionally reports
+`permission: 'not_evaluated'`, `health: 'not_checked'`, `quote: 'not_requested'`,
+and `canLiquidate: null`, even when every observed flag is true. A quote alone
+also does not establish health or permission. Verify deployment-specific gate
+semantics and current borrower health; unknown permissions must stop execution.
+An EOA's core flag does not establish the PublicLiquidator's borrower gate.
+
+The SDK's 200 TRX fee limit is a ceiling, not an estimate or actual fee. No budget
+or dependency version changes are included with these diagnostics.
