@@ -17,7 +17,7 @@ import React, { useMemo } from "react";
 import ReactDOM from "react-dom/client";
 import Example from "./Example.jsx";
 import { WalletProvider } from "@tronweb3/tronwallet-adapter-react-hooks";
-import { TronLinkAdapter } from "@tronweb3/tronwallet-adapters";
+import { TronLinkAdapter } from "@tronweb3/tronwallet-adapter-tronlink";
 
 function Root() {
   const adapters = useMemo(() => [new TronLinkAdapter()], []);
