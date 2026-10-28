@@ -1053,14 +1053,25 @@ export function createEnergyPurchaseClient(options = {}) {
       }
     }
 
-    clearStoredRisk(input.payerAddress, txId);
     const batch = order?.batch;
     const payment = order?.payment;
     if (!batch || typeof batch.id !== 'string' || typeof batch.access_token !== 'string') {
-      throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy purchase response is missing batch or access token.');
+      throw new EnergyPurchaseError(
+        'INVALID_RESPONSE',
+        'Energy purchase response is missing batch or access token.',
+        { paymentRisk: risk }
+      );
     }
     const orderId = batch.id;
     const txHash = payment?.tx_hash || txId;
+    // An HTTP success means the service may have accepted and broadcast the
+    // signed payment. Commit that fact before exposing the order result: a
+    // crash, malformed response, or callback failure must never erase the
+    // durable marker and permit another signature.
+    risk.paymentConfirmed = true;
+    risk.recoveredOrder = recoveredOrderMetadata(order);
+    writeRisk(storage, risk);
+    signedRequests.delete(replayKey(risk));
     input.onOrderAccepted?.({ orderId, txHash, state: batch.state || 'pending' });
     input.onState?.('delivering');
     const detail = await pollOrder(orderId, {
@@ -1071,10 +1082,11 @@ export function createEnergyPurchaseClient(options = {}) {
     const state = detail?.state || batch.state || 'pending';
     if (state === 'failed' || state === 'expired') {
       throw new EnergyPurchaseError('DELIVERY_FAILED', 'Payment was accepted but energy delivery failed.', {
-        details: { orderId, txHash, state, detail }
+        details: { orderId, txHash, state, detail },
+        paymentRisk: risk
       });
     }
-    return { ok: true, orderId, txHash, state, detail };
+    return { ok: true, orderId, txHash, state, detail, paymentRisk: publicRisk(risk) };
   }
 
   async function purchase(input) {
