@@ -22,6 +22,7 @@ export const ENERGY_PURCHASE_PATHS = Object.freeze({
   poolHealth: '/v1/pool/health',
   quote: '/v1/price',
   buy: '/v1/consumer/energy/buy',
+  history: '/v1/consumer/energy/orders/history',
   order: id => `/v1/consumer/energy/orders/${encodeURIComponent(String(id))}`
 });
 
@@ -107,6 +108,90 @@ function validatePositiveInteger(value, label) {
   }
 }
 
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+function responseInteger(value, label) {
+  const number = typeof value === 'number' ? value
+    : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new EnergyPurchaseError('INVALID_RESPONSE', `${label} must be a positive safe integer.`);
+  }
+  return number;
+}
+
+// Keep the SDK's public names, but never silently choose between contradictory
+// current/legacy API fields. Error messages deliberately omit response values.
+function responseAlias(value, legacy, current, normalize = item => item) {
+  const oldValue = value[legacy] === undefined ? undefined : normalize(value[legacy]);
+  const newValue = value[current] === undefined ? undefined : normalize(value[current]);
+  if (oldValue !== undefined && newValue !== undefined && JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+    throw new EnergyPurchaseError('INVALID_RESPONSE', `Conflicting ${legacy}/${current} response fields.`);
+  }
+  return newValue === undefined ? oldValue : newValue;
+}
+
+function normalizeConfig(value) {
+  if (!isRecord(value)) throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy configuration must be an object.');
+  const config = {
+    ...value,
+    min_energy: responseInteger(value.min_energy, 'min_energy'),
+    max_energy: responseInteger(value.max_energy, 'max_energy'),
+    max_batch_receivers: responseAlias(value, 'max_batch_receivers', 'max_receivers', item => responseInteger(item, 'max_receivers')),
+    supported_durations: responseAlias(value, 'supported_durations', 'durations'),
+    energy_presets: responseAlias(value, 'energy_presets', 'presets')
+  };
+  if (!config.max_batch_receivers || config.min_energy > config.max_energy) {
+    throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy configuration limits are invalid.');
+  }
+  return config;
+}
+
+function normalizeQuote(value, config) {
+  if (!isRecord(value)) throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy quote must be an object.');
+  const quote = {
+    ...value,
+    total_sun: responseAlias(value, 'total_sun', 'amount_sun', item => responseInteger(item, 'amount_sun')),
+    total_trx: responseAlias(value, 'total_trx', 'amount_trx', String),
+    payment_address: responseAlias(value, 'payment_address', 'pay_address')
+  };
+  // Older deployments supplied the payee only in config. A payee supplied by
+  // the quote is authoritative and still must match the user's confirmation.
+  if (quote.payment_address === undefined) quote.payment_address = config.payment_address;
+  responseInteger(quote.total_sun, 'amount_sun');
+  try {
+    validateAddress(quote.payment_address, 'quote payment address');
+  } catch (cause) {
+    throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy quote has an invalid payment address.', { cause });
+  }
+  if (quote.can_fulfill === false) throw new EnergyPurchaseError('POOL_INSUFFICIENT', 'The resource pool cannot fulfill this purchase.');
+  return quote;
+}
+
+function normalizeOrderId(value) {
+  if ((typeof value === 'number' && Number.isSafeInteger(value) && value > 0) ||
+      (typeof value === 'string' && value.trim())) return String(value).trim();
+  throw new EnergyPurchaseError('INVALID_ORDER_ID', 'Order id must be a positive safe integer or nonempty string.');
+}
+
+function normalizeOrder(value, signedTxId) {
+  if (!isRecord(value)) throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy order must be an object.');
+  const batch = isRecord(value.batch) ? value.batch : {};
+  try {
+    const id = responseAlias({ legacy: batch.id, current: value.id }, 'legacy', 'current', normalizeOrderId);
+    if (id === undefined) throw new Error('missing id');
+    const token = responseAlias({ legacy: batch.access_token, current: value.access_token }, 'legacy', 'current');
+    if (token != null && typeof token !== 'string') throw new Error('invalid token');
+    const topTxId = responseAlias(value, 'payment_tx_id', 'tx_id', normalizeHex);
+    const txId = responseAlias({ legacy: value.payment?.tx_hash, current: topTxId }, 'legacy', 'current', normalizeHex) ?? signedTxId;
+    if (normalizeHex(txId) !== normalizeHex(signedTxId)) throw new Error('transaction mismatch');
+    const state = responseAlias({ legacy: batch.state, current: value.state }, 'legacy', 'current');
+    if (state !== undefined && (typeof state !== 'string' || !state.trim())) throw new Error('invalid state');
+    return { id, token: token || undefined, txId: signedTxId, state: state || 'pending' };
+  } catch {
+    throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy order has missing, conflicting or invalid identity fields.');
+  }
+}
+
 function validateQuoteInput(input, config) {
   const receivers = input?.receivers;
   if (!Array.isArray(receivers) || receivers.length === 0) {
@@ -139,7 +224,6 @@ function validateQuoteInput(input, config) {
       'duration must be explicitly selected from the live /v1/config supported_durations list.'
     );
   }
-  validateAddress(config.payment_address, 'config payment_address');
 }
 
 function normalizeHex(value) {
@@ -271,7 +355,13 @@ function recoveredOrderMetadata(order) {
   const payment = order.payment && typeof order.payment === 'object' && !Array.isArray(order.payment)
     ? { tx_hash: order.payment.tx_hash }
     : undefined;
-  return { ...(batch ? { batch } : {}), ...(payment ? { payment } : {}) };
+  // Current API responses/history use top-level fields. Retain only identities
+  // and delivery state, never the access token or a replayable signed body.
+  const top = {};
+  for (const key of ['id', 'state', 'tx_id', 'payment_tx_id']) {
+    if (typeof order[key] === 'string' || typeof order[key] === 'number') top[key] = order[key];
+  }
+  return { ...top, ...(batch ? { batch } : {}), ...(payment ? { payment } : {}) };
 }
 
 /** Strip every replayable credential before a risk crosses the storage/API boundary. */
@@ -672,41 +762,37 @@ export function createEnergyPurchaseClient(options = {}) {
     return envelope.data;
   }
 
-  const getConfig = requestOptions => request('GET', ENERGY_PURCHASE_PATHS.config, requestOptions);
+  const getConfig = async requestOptions => normalizeConfig(await request('GET', ENERGY_PURCHASE_PATHS.config, requestOptions));
   const getCurrentPrice = requestOptions => request('GET', ENERGY_PURCHASE_PATHS.currentPrice, requestOptions);
   const getPoolHealth = requestOptions => request('GET', ENERGY_PURCHASE_PATHS.poolHealth, requestOptions);
 
   async function quote(input, requestOptions) {
-    const config = input.config || (await getConfig(requestOptions));
+    const config = input.config ? normalizeConfig(input.config) : await getConfig(requestOptions);
     validateQuoteInput(input, config);
     const result = await request('POST', ENERGY_PURCHASE_PATHS.quote, {
       ...requestOptions,
-      body: { receivers: input.receivers, quantity: input.energyPerReceiver, duration: input.duration }
+      body: { receivers: input.receivers, energy_per_receiver: input.energyPerReceiver }
     });
-    if (
-      !result ||
-      !Number.isSafeInteger(Number(result.total_sun)) ||
-      Number(result.total_sun) <= 0
-    ) {
-      throw new EnergyPurchaseError('INVALID_RESPONSE', 'Energy purchase quote is missing required fields.');
-    }
-    return { ...result, payment_address: config.payment_address };
+    return normalizeQuote(result, config);
   }
 
   async function getOrder(orderId, requestOptions = {}) {
-    if (orderId === undefined || orderId === null || String(orderId).length === 0) {
-      throw new EnergyPurchaseError('INVALID_ORDER_ID', 'orderId is required.');
-    }
-    return request('GET', ENERGY_PURCHASE_PATHS.order(orderId), requestOptions);
+    return request('GET', ENERGY_PURCHASE_PATHS.order(normalizeOrderId(orderId)), requestOptions);
   }
 
   async function getHistory(address, historyOptions = {}) {
-    void address;
-    void historyOptions;
-    throw new EnergyPurchaseError(
-      'UNSUPPORTED_OPERATION',
-      'The authoritative energy API has no order-history endpoint; persist the returned order ID and access token.'
-    );
+    validateAddress(address, 'history address');
+    const { page = 1, size = 20, signal, timeoutMs } = historyOptions;
+    if (!Number.isSafeInteger(page) || page < 1 || !Number.isSafeInteger(size) || size < 1 || size > 200) {
+      throw new EnergyPurchaseError('INVALID_PAGINATION', 'History page must be a positive safe integer and size must be between 1 and 200.');
+    }
+    const query = new URLSearchParams({ address, page: String(page), size: String(size) });
+    const result = await request('GET', `${ENERGY_PURCHASE_PATHS.history}?${query}`, { signal, timeoutMs });
+    if (!isRecord(result) || !Array.isArray(result.rows) || !result.rows.every(isRecord) ||
+        !Number.isSafeInteger(result.total) || result.total < result.rows.length) {
+      throw new EnergyPurchaseError('INVALID_RESPONSE', 'History must contain rows and a nonnegative safe integer total.');
+    }
+    return result;
   }
 
   async function buildAndSignPayment({ payerAddress, payAddress, amountSun, receivers, energyPerReceiver, duration, signTransaction }) {
@@ -808,6 +894,31 @@ export function createEnergyPurchaseClient(options = {}) {
     writeRisk(storage, risk);
   }
 
+  async function recoverOrderFromHistory(risk, historyOptions) {
+    // The endpoint scopes the result to payerAddress. Require an exact tx ID
+    // as well; a matching order number alone cannot identify a payment.
+    try {
+      const history = await getHistory(risk.payerAddress, historyOptions);
+      for (const row of history.rows) {
+        if (row.payer_address !== undefined && row.payer_address !== risk.payerAddress) continue;
+        if (normalizeHex(row.payment_tx_id) !== normalizeHex(risk.signedTxId)) continue;
+        let id;
+        try { id = normalizeOrderId(row.order_id); } catch { continue; }
+        risk.paymentConfirmed = true;
+        // A history row is one receiver, not the aggregate order delivery state.
+        risk.recoveredOrder = recoveredOrderMetadata({ id, tx_id: risk.signedTxId });
+        writeRisk(storage, risk);
+        signedRequests.delete(replayKey(risk));
+        return true;
+      }
+    } catch (error) {
+      if (error.code === 'RISK_STORE_UNAVAILABLE') throw error;
+      // History is eventually consistent. An error or a page without this
+      // transaction proves nothing about whether the payment was accepted.
+    }
+    return false;
+  }
+
   async function reconcilePaymentRisksUnlocked(payerAddress, reconcileOptions = {}) {
     validateAddress(payerAddress, 'payerAddress');
     const risks = readRisks(storage, payerAddress);
@@ -820,10 +931,12 @@ export function createEnergyPurchaseClient(options = {}) {
         continue;
       }
       if (!fingerprint || risk.networkFingerprint !== fingerprint) continue;
+      if (await recoverOrderFromHistory(risk, reconcileOptions.history)) continue;
       const signedRequest = signedRequests.get(replayKey(risk));
       if (confirmReplay && signedRequest && risk.paymentConfirmed !== true) {
         try {
           const recoveredOrder = await request('POST', ENERGY_PURCHASE_PATHS.buy, { body: signedRequest });
+          normalizeOrder(recoveredOrder, risk.signedTxId);
           // Keep an accepted/recovered marker until the caller explicitly records
           // the returned order and clears it. Automatically clearing here would
           // let purchase() sign a second payment in the same invocation.
@@ -838,11 +951,9 @@ export function createEnergyPurchaseClient(options = {}) {
             writeRisk(storage, risk);
             signedRequests.delete(replayKey(risk));
             continue;
-          } else if (shouldClearSignedRisk(error)) {
-            clearStoredRisk(payerAddress, risk.signedTxId);
-            continue;
           }
-          // Ambiguous replay failures fall through to read-only chain evidence.
+          // A rejection of this replay cannot disprove acceptance of an earlier
+          // attempt. Only independent solidified failure may clear the risk.
         }
       }
 
@@ -879,7 +990,7 @@ export function createEnergyPurchaseClient(options = {}) {
     validateAddress(input.payerAddress, 'payerAddress');
     assertCurrentPayer(input.payerAddress);
     const risksBeforeReconciliation = readRisks(storage, input.payerAddress);
-    // Starting a new purchase only performs read-only chain reconciliation.
+    // Starting a new purchase only performs read-only history/chain reconciliation.
     // Replaying an older signed body requires the caller to invoke the explicit
     // recovery API with confirmReplay=true.
     const reconciledRisks = await reconcilePaymentRisksUnlocked(input.payerAddress);
@@ -897,7 +1008,8 @@ export function createEnergyPurchaseClient(options = {}) {
     }
 
     input.onState?.('quoting');
-    const config = input.config || (await getConfig({ signal: input.signal }));
+    // A cached preview config cannot authorize a payment after limits change.
+    const config = await getConfig({ signal: input.signal });
     const durations = Array.isArray(config?.supported_durations)
       ? config.supported_durations.filter(value => typeof value === 'string' && value.trim()).map(value => value.trim())
       : [];
@@ -923,12 +1035,12 @@ export function createEnergyPurchaseClient(options = {}) {
     if (typeof input.expectedPayAddress !== 'string') {
       throw new EnergyPurchaseError(
         'CONFIRMATION_REQUIRED',
-        'expectedPayAddress is required and must match the live configuration exactly.'
+        'expectedPayAddress is required and must match the authoritative quote exactly.'
       );
     }
     validateAddress(input.expectedPayAddress, 'expectedPayAddress');
     if (authoritativeQuote.payment_address !== input.expectedPayAddress) {
-      throw new EnergyPurchaseError('PAYMENT_ADDRESS_CHANGED', 'The configured payment address differs from the confirmed address.');
+      throw new EnergyPurchaseError('PAYMENT_ADDRESS_CHANGED', 'The quoted payment address differs from the confirmed address.');
     }
     const networkFingerprint = requireNetworkFingerprint();
 
@@ -972,7 +1084,7 @@ export function createEnergyPurchaseClient(options = {}) {
     const retryDeadline = Math.min(signedDeadline, now() + paymentRetryTimeoutMs);
     const signedRequest = {
       receivers: [...input.receivers],
-      energy: input.energyPerReceiver,
+      energy_per_receiver: input.energyPerReceiver,
       duration: input.duration,
       payer_address: input.payerAddress,
       signed_transaction: signedTransactionForWire(signed)
@@ -989,7 +1101,8 @@ export function createEnergyPurchaseClient(options = {}) {
 
     input.onState?.('submitting');
     let order;
-    while (!order) {
+    let paymentMayHaveBeenBroadcast = false;
+    while (true) {
       if (input.signal?.aborted) throw new EnergyPurchaseError('ABORTED', 'Energy purchase was aborted.');
       writeRisk(storage, risk);
       try {
@@ -997,17 +1110,20 @@ export function createEnergyPurchaseClient(options = {}) {
           body: signedRequest,
           signal: input.signal
         });
+        break;
       } catch (error) {
         if (error.isBusinessError) {
           if (error.code === 'TX_ALREADY_CLAIMED') {
             risk.paymentConfirmed = true;
             writeRisk(storage, risk);
             error.paymentRisk = risk;
-          } else if (shouldClearSignedRisk(error)) {
+          } else if (!paymentMayHaveBeenBroadcast && shouldClearSignedRisk(error)) {
             clearStoredRisk(input.payerAddress, txId);
           }
+          if (paymentMayHaveBeenBroadcast) error.paymentRisk = publicRisk(risk);
           throw error;
         }
+        paymentMayHaveBeenBroadcast = true;
         if (now() >= retryDeadline) {
           const lookup = await lookupTransaction(txId);
           if (['observed', 'included', 'solidified'].includes(lookup.status)) {
@@ -1053,17 +1169,15 @@ export function createEnergyPurchaseClient(options = {}) {
       }
     }
 
-    const batch = order?.batch;
-    const payment = order?.payment;
-    if (!batch || typeof batch.id !== 'string' || typeof batch.access_token !== 'string') {
-      throw new EnergyPurchaseError(
-        'INVALID_RESPONSE',
-        'Energy purchase response is missing batch or access token.',
-        { paymentRisk: risk }
-      );
+    let acceptedOrder;
+    try {
+      acceptedOrder = normalizeOrder(order, txId);
+    } catch (error) {
+      error.paymentRisk = publicRisk(risk);
+      throw error;
     }
-    const orderId = batch.id;
-    const txHash = payment?.tx_hash || txId;
+    const orderId = acceptedOrder.id;
+    const txHash = acceptedOrder.txId;
     // An HTTP success means the service may have accepted and broadcast the
     // signed payment. Commit that fact before exposing the order result: a
     // crash, malformed response, or callback failure must never erase the
@@ -1072,21 +1186,22 @@ export function createEnergyPurchaseClient(options = {}) {
     risk.recoveredOrder = recoveredOrderMetadata(order);
     writeRisk(storage, risk);
     signedRequests.delete(replayKey(risk));
-    input.onOrderAccepted?.({ orderId, txHash, state: batch.state || 'pending' });
+    input.onOrderAccepted?.({ orderId, txHash, state: acceptedOrder.state });
     input.onState?.('delivering');
-    const detail = await pollOrder(orderId, {
-      token: batch.access_token,
+    const detail = acceptedOrder.token ? await pollOrder(orderId, {
+      token: acceptedOrder.token,
       signal: input.signal,
       onState: input.onOrderState
-    });
-    const state = detail?.state || batch.state || 'pending';
+    }) : null;
+    const state = detail?.state || acceptedOrder.state;
+    const reconciliationRequired = !ENERGY_PURCHASE_TERMINAL_STATES.includes(state);
     if (state === 'failed' || state === 'expired') {
       throw new EnergyPurchaseError('DELIVERY_FAILED', 'Payment was accepted but energy delivery failed.', {
-        details: { orderId, txHash, state, detail },
+        details: { orderId, txHash, state, detail, reconciliationRequired },
         paymentRisk: risk
       });
     }
-    return { ok: true, orderId, txHash, state, detail, paymentRisk: publicRisk(risk) };
+    return { ok: true, orderId, txHash, state, detail, reconciliationRequired, paymentRisk: publicRisk(risk) };
   }
 
   async function purchase(input) {
@@ -1121,7 +1236,7 @@ export function createEnergyPurchaseClient(options = {}) {
       if (targets.some(risk => risk.paymentConfirmed !== true)) {
         throw new EnergyPurchaseError(
           'MANUAL_RESOLUTION_REQUIRED',
-          'Only a payment accepted by exact /buy replay or proven solidified can be cleared automatically; unresolved risks require operator recovery.'
+          'Only a payment accepted by /buy, matched in payer history or proven solidified can be acknowledged; unresolved risks require operator recovery.'
         );
       }
       clearStoredRisk(payerAddress, riskId);

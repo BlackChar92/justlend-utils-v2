@@ -107,6 +107,13 @@ Energy direct purchase uses a separately deployed API. The library deliberately 
 production URL or economic fallbacks: inject the URL, then load limits, durations, prices, and pool
 capacity from the live API.
 
+The client accepts current API configuration fields (`max_receivers`, `durations`, `presets`)
+and the older equivalents, exposing the stable SDK names `max_batch_receivers`,
+`supported_durations`, and `energy_presets`. Quotes normalize `amount_sun` / `pay_address`
+to `total_sun` / `payment_address`; conflicting aliases are rejected. Quote and purchase
+requests use `energy_per_receiver`. Purchase always refreshes configuration and the quote
+before signing, even when a preview supplied a cached `config`.
+
 ```javascript
 import { createEnergyPurchaseClient } from 'justlend-v2-utils';
 
@@ -132,23 +139,33 @@ console.log(quote.total_sun, quote.payment_address, await energy.getPoolHealth()
 ```
 
 The `purchase()` workflow performs a fresh authoritative quote, builds a native TRX payment,
-requests a wallet signature, submits the signed transaction to the backend, and polls the order.
+requests a wallet signature, submits the signed transaction to the backend, and polls a token-bearing order.
+Both current top-level order responses and older `batch` responses are supported. An accepted
+order without an access token is returned immediately with its ID. This workflow deliberately
+does not automatically poll tokenless responses; current deployments also expose public details
+through `getOrder(id)`. Use public history for subsequent observation. `reconciliationRequired` indicates
+that the returned delivery state is not terminal, not that a new payment is safe.
 It **never broadcasts the payment from the client**. Ambiguous submissions retry only the same
 signed transaction and leave a payment-risk marker that blocks silent creation of another payment.
 Risk storage contains metadata only (`signedTxId`, status, timestamps, and network fingerprint),
 never the signed body or an order access token. In the same client session, call
-`reconcilePaymentRisks(payerAddress)` for read-only chain reconciliation. Replaying the in-memory
+`reconcilePaymentRisks(payerAddress)` for read-only history and chain reconciliation. Replaying the in-memory
 signed request requires an explicit `reconcilePaymentRisks(payerAddress, { confirmReplay: true })`
 call, and every risk API verifies that `payerAddress` matches the current `tronWeb.defaultAddress`
 (or the client-level `payerAddress` / `getCurrentPayerAddress` binding). After a restart the signed
-body is intentionally unavailable; the metadata marker remains blocked until chain evidence or an
-operator recovery process resolves it. Network changes and legacy/incomplete markers also stay
+body is intentionally unavailable; an exact transaction match in payer-scoped history can recover
+the order identity without another signature. A missing row, an incomplete page, or a history/RPC
+error never unlocks the marker. Network changes and legacy/incomplete markers also stay
 blocked. Reconciled records expose
 `chainStatus` (`observed`/`included` from FullNode, then `solidified` from SolidityNode) and
 `chainExecution`; unavailable or missing RPC evidence never permits a new signature.
 Even a successful `purchase()` retains a confirmed payment marker until the application has
 durably recorded its order result. The returned `paymentRisk` identifies that marker; after
 recording the result, explicitly clear it before beginning another purchase.
+For backward compatibility, `paymentConfirmed` means backend acceptance/history evidence **or**
+solidified payment success; it does not by itself prove chain finality or complete energy delivery.
+Use `chainStatus` for finality and order details/history rows for delivery. History is one row per
+receiver, so recovery does not infer the aggregate delivery state from a single matching row.
 
 In a browser, the client uses same-origin `localStorage` plus the Web Locks API across tabs. If Web
 Locks is unavailable, pass a cross-context `paymentLock`. In Node.js there is no safe implicit
@@ -169,7 +186,25 @@ const result = await energy.purchase({
 });
 
 await persistAcceptedOrder(result);
-await energy.clearPaymentRisk(tronWeb.defaultAddress.base58, result.paymentRisk.intentId);
+if (result.paymentRisk.paymentConfirmed) {
+  // Explicit acknowledgement, not an automatic retry after an unknown outcome.
+  await energy.clearPaymentRisk(tronWeb.defaultAddress.base58, result.paymentRisk.intentId);
+}
+```
+
+Public history is read-only and does not require an order token:
+
+```javascript
+const payer = tronWeb.defaultAddress.base58;
+const history = await energy.getHistory(payer, { page: 1, size: 20 });
+// rows and total are preserved; invalid responses and network errors throw.
+// Defaults: page 1, size 20. size must be between 1 and 200.
+await persistHistory(history);
+
+// Recovery normally inspects page 1; select another page explicitly if needed.
+const risks = await energy.reconcilePaymentRisks(payer, { history: { page: 2, size: 20 } });
+// Record recovered identities before acknowledging a marker. Never interpret a
+// page without a match as proof that an earlier payment was not accepted.
 ```
 
 Do not log or persist `signed_transaction`: anyone who obtains it may broadcast it before expiry.
