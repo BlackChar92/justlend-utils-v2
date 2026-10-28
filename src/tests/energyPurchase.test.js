@@ -626,6 +626,23 @@ describe('App master energy API compatibility', () => {
     expect(restarted.signTransaction).not.toHaveBeenCalled();
   });
 
+  it.each(['observed', 'included', 'solidified'])('U4 chain-only %s recovery still requires delivery reconciliation', async status => {
+    const { client, tronWeb, signTransaction } = harness({
+      buy: () => { throw new Error('accepted response lost'); },
+      options: { paymentRetryTimeoutMs: 0 }
+    });
+    if (status === 'observed') tronWeb.trx.getTransaction.mockResolvedValue({ txID: TX_ID });
+    else {
+      const lookup = status === 'solidified' ? 'getTransactionInfo' : 'getUnconfirmedTransactionInfo';
+      tronWeb.trx[lookup].mockResolvedValue({ id: TX_ID, blockNumber: 100, receipt: { result: 'SUCCESS' } });
+    }
+    await expect(client.purchase(purchaseInput(signTransaction))).resolves.toMatchObject({
+      orderId: null, state: 'pending', chainStatus: status, reconciliationRequired: true,
+      paymentRisk: { paymentConfirmed: status === 'solidified' }
+    });
+    expect(signTransaction).toHaveBeenCalledTimes(1);
+  });
+
   it('U5 rejects an invalid history address before making a request', async () => {
     const { client, fetch } = harness();
     await expect(client.getHistory('bad-address')).rejects.toMatchObject({ code: 'INVALID_ADDRESS' });

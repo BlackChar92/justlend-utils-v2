@@ -1152,6 +1152,7 @@ export function createEnergyPurchaseClient(options = {}) {
               orderId: null,
               txHash: txId,
               state: 'pending',
+              reconciliationRequired: true,
               observedOnChain: true,
               confirmedOnChain: lookup.status === 'solidified',
               chainStatus: lookup.status,
