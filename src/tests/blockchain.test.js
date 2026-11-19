@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
-import { tronObj, getNetworkType, getDefaultAccount, triggerV2 } from '../utils/blockchain';
+import { tronObj, getNetworkType, getDefaultAccount, sendRawTransaction, triggerV2 } from '../utils/blockchain';
 import { getContractsAddress } from '../utils/systemV2';
 
 describe('getNetworkType', () => {
@@ -173,6 +173,34 @@ describe('broadcast error privacy', () => {
       expect(broadcast).toHaveBeenCalledWith(signed);
     },
   );
+
+  it.each([
+    ['the raw broadcast helper', () => sendRawTransaction(signed), []],
+    ['the V2 write helper', () => triggerV2(tronObj.defaultAccount, 'audit()'), [['triggerV2 error: Broadcast request failed']]],
+  ])('redacts a transport exception from %s', async (_entry, call, expectedLogs) => {
+    const providerError = Object.assign(new Error('mock private diagnostic'), {
+      config: { data: 'mock request body' },
+      response: { data: 'mock response body' },
+      cause: new Error('mock transport detail'),
+    });
+    broadcast.mockRejectedValue(providerError);
+
+    const result = call();
+    await expect(result).rejects.toThrow(/^Broadcast request failed$/);
+    await expect(result).rejects.not.toBe(providerError);
+    await expect(result).rejects.not.toHaveProperty('config');
+    await expect(result).rejects.not.toHaveProperty('response');
+    await expect(result).rejects.not.toHaveProperty('cause');
+    expect(log.mock.calls).toEqual(expectedLogs);
+  });
+
+  it.each([true, false])('preserves a raw broadcast response with result=%s', async (accepted) => {
+    const response = { result: accepted, transaction: signed };
+    broadcast.mockResolvedValue(response);
+
+    await expect(sendRawTransaction(signed)).resolves.toBe(response);
+    expect(log).not.toHaveBeenCalled();
+  });
 
   it('preserves successful SDK responses without logging them', async () => {
     const result = { result: true, transaction: signed };

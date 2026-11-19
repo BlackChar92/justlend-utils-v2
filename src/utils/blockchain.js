@@ -155,11 +155,10 @@ export const triggerSmartContract = async (
 
 export const sendRawTransaction = async (signedTransaction) => {
   try {
-    const result =
-      await tronObj.tronWeb.trx.sendRawTransaction(signedTransaction);
-    return result;
-  } catch (error) {
-    throw error;
+    return await tronObj.tronWeb.trx.sendRawTransaction(signedTransaction);
+  } catch {
+    // Transport errors can retain the signed request in their metadata.
+    throw new Error("Broadcast request failed");
   }
 };
 
