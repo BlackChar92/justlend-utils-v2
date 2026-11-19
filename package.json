@@ -55,7 +55,10 @@
       "@babel/core@<=7.29.0": "7.29.7",
       "nanoid@<3.3.18": "3.3.18",
       "browserslist@<4.28.7": "4.29.3",
-      "source-map-js@<1.2.2": "1.2.2"
+      "source-map-js@<1.2.2": "1.2.2",
+      "zod": "4.6.6",
+      "decode-uri-component": "0.5.1",
+      "query-string": "9.5.1"
     }
   },
   "devDependencies": {
@@ -85,6 +88,6 @@
   },
   "homepage": "https://github.com/justlend/justlend-utils-v2#readme",
   "engines": {
-    "node": "24.22.1"
+    "node": "24.22.3"
   }
 }
